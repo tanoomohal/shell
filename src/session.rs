@@ -8,6 +8,7 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::tty;
@@ -75,6 +76,8 @@ pub struct Session {
     pub title: String,
     /// Decides the tab's label from foreground-process readings.
     label: LabelTracker,
+    /// Last meaningful line of output, shown under the tab's label.
+    summary: String,
     pub activity: Activity,
     /// Set when a background tab starts waiting on the user, cleared when the
     /// tab is next focused.
@@ -127,6 +130,7 @@ impl Session {
             size,
             title: String::new(),
             label: LabelTracker::new(shell_name()),
+            summary: String::new(),
             activity: Activity::Idle,
             needs_attention: false,
             tracker: ActivityTracker::default(),
@@ -155,6 +159,50 @@ impl Session {
         self.label.kind()
     }
 
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    /// Re-reads the tab's last meaningful line of output. Returns whether it
+    /// changed.
+    ///
+    /// Scans the viewport bottom-up and takes the first line that survives
+    /// `summarize_line`. The cursor's own line is skipped: for a shell sitting
+    /// at an empty prompt that line *is* the prompt, and the useful summary is
+    /// the output above it.
+    pub fn refresh_summary(&mut self) -> bool {
+        let next = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            let cursor_line = grid.cursor.point.line;
+            let columns = grid.columns();
+
+            let mut found = None;
+            for index in (0..grid.screen_lines()).rev() {
+                let line = Line(index as i32);
+                if line == cursor_line {
+                    continue;
+                }
+                let row = &grid[line];
+                let mut raw = String::with_capacity(columns);
+                for column in 0..columns {
+                    raw.push(row[Column(column)].c);
+                }
+                if let Some(summary) = summarize_line(&raw) {
+                    found = Some(summary);
+                    break;
+                }
+            }
+            found.unwrap_or_default()
+        };
+
+        if next == self.summary {
+            return false;
+        }
+        self.summary = next;
+        true
+    }
+
     pub fn mark_output(&mut self) {
         self.tracker.mark_output();
     }
@@ -168,6 +216,7 @@ impl Session {
             return false;
         };
         let mut changed = self.label.observe(&name);
+        changed |= self.refresh_summary();
         let activity = self.tracker.activity(self.label.kind());
 
         if activity != self.activity {
@@ -205,4 +254,119 @@ fn shell_name() -> String {
                 .map(|n| n.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "sh".to_string())
+}
+
+/// Longest summary shown in the sidebar, in characters.
+const SUMMARY_MAX_CHARS: usize = 52;
+
+/// Characters that carry no meaning in a summary: rules, borders, spinner
+/// frames, bullets, and prompt markers.
+fn is_decoration(c: char) -> bool {
+    matches!(c,
+        '\u{2190}'..='\u{21ff}'   // arrows
+        | '\u{2500}'..='\u{257f}' // box drawing
+        | '\u{2580}'..='\u{259f}' // block elements
+        | '\u{25a0}'..='\u{25ff}' // geometric shapes
+        | '\u{2800}'..='\u{28ff}' // braille, used for spinners
+        | '\u{2022}' | '\u{00b7}' | '\u{2039}' | '\u{203a}' | '\u{00ab}' | '\u{00bb}'
+        | '>' | '<' | '$' | '%' | '#' | '*' | '|' | '=' | '-' | '_' | '+' | '~'
+    )
+}
+
+/// Reduces one grid row to a summary, or `None` if it carries nothing worth
+/// showing.
+fn summarize_line(raw: &str) -> Option<String> {
+    let cleaned = raw.trim_matches(|c: char| is_decoration(c) || c.is_whitespace());
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    // Collapse internal whitespace runs, since grid rows are space-padded and
+    // TUIs align with wide gaps.
+    let mut out = String::with_capacity(cleaned.len());
+    let mut in_space = false;
+    for c in cleaned.chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+            }
+            in_space = true;
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    let out = out.trim();
+
+    // Require some actual words, so rules and lone punctuation are rejected.
+    if out.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
+        return None;
+    }
+
+    if out.chars().count() > SUMMARY_MAX_CHARS {
+        let mut truncated: String = out.chars().take(SUMMARY_MAX_CHARS - 1).collect();
+        truncated.push('\u{2026}');
+        return Some(truncated);
+    }
+    Some(out.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_and_padded_rows_are_rejected() {
+        assert_eq!(summarize_line(""), None);
+        assert_eq!(summarize_line("                    "), None);
+    }
+
+    #[test]
+    fn rules_and_borders_are_rejected() {
+        assert_eq!(summarize_line("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"), None);
+        assert_eq!(summarize_line("------------"), None);
+        assert_eq!(summarize_line("| |"), None);
+    }
+
+    #[test]
+    fn spinner_frames_are_stripped() {
+        // A braille spinner plus a status message.
+        assert_eq!(
+            summarize_line("\u{28f7} Building project").as_deref(),
+            Some("Building project")
+        );
+    }
+
+    #[test]
+    fn prompt_markers_are_stripped() {
+        assert_eq!(summarize_line("> npm test").as_deref(), Some("npm test"));
+        assert_eq!(
+            summarize_line("$ cargo build --release").as_deref(),
+            Some("cargo build --release")
+        );
+    }
+
+    #[test]
+    fn interior_whitespace_collapses() {
+        assert_eq!(
+            summarize_line("  tests      42 passed   ").as_deref(),
+            Some("tests 42 passed")
+        );
+    }
+
+    #[test]
+    fn long_lines_are_truncated_with_an_ellipsis() {
+        let long = "a".repeat(200);
+        let out = summarize_line(&long).unwrap();
+        assert_eq!(out.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn box_drawn_status_lines_survive() {
+        assert_eq!(
+            summarize_line("\u{2502} Waiting for your input \u{2502}").as_deref(),
+            Some("Waiting for your input")
+        );
+    }
 }

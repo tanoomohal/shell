@@ -22,7 +22,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Theme as WindowTheme, Window, WindowId};
+use winit::window::{CursorIcon, Theme as WindowTheme, Window, WindowId};
 
 use renderer::Renderer;
 use session::{Session, TermSize, UserEvent};
@@ -68,6 +68,8 @@ struct State {
     cursor: PhysicalPosition<f64>,
     /// Fractional wheel remainder, so trackpad scrolling doesn't lose motion.
     scroll_remainder: f64,
+    /// Set while the sidebar divider is being dragged.
+    dragging_divider: bool,
     /// Clock for the attention pulse.
     started: Instant,
     renderer: Renderer,
@@ -239,6 +241,7 @@ impl ApplicationHandler<UserEvent> for App {
             mods: ModifiersState::empty(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             scroll_remainder: 0.0,
+            dragging_divider: false,
             started: Instant::now(),
             renderer,
         });
@@ -276,7 +279,40 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::ModifiersChanged(mods) => state.mods = mods.state(),
 
-            WindowEvent::CursorMoved { position, .. } => state.cursor = position,
+            WindowEvent::CursorMoved { position, .. } => {
+                state.cursor = position;
+
+                if state.dragging_divider {
+                    let logical = position.x as f32 / state.renderer.scale;
+                    if state.renderer.set_sidebar_width(logical) {
+                        // The grid narrowed or widened, so the ptys have to be
+                        // told about their new size.
+                        state.resize_sessions();
+                        state.renderer.window().request_redraw();
+                    }
+                    return;
+                }
+
+                let over_divider = matches!(
+                    state.renderer.layout.hit_test(
+                        position.x as f32,
+                        position.y as f32,
+                        state.sessions.len()
+                    ),
+                    Hit::Divider
+                );
+                state.renderer.window().set_cursor(if over_divider {
+                    CursorIcon::ColResize
+                } else {
+                    CursorIcon::Default
+                });
+            },
+
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => state.dragging_divider = false,
 
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -301,6 +337,7 @@ impl ApplicationHandler<UserEvent> for App {
                             event_loop.exit();
                         }
                     },
+                    Hit::Divider => state.dragging_divider = true,
                     Hit::Grid => {},
                 }
             },

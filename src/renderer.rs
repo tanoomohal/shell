@@ -6,6 +6,7 @@ use std::sync::Arc;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::point_to_viewport;
 use alacritty_terminal::vte::ansi::CursorShape;
+use glyphon::cosmic_text::{Ellipsize, EllipsizeHeightLimit};
 use glyphon::{
     Attrs, Buffer as TextBuffer, Cache, Color as TextColor, Family, FontSystem, Metrics,
     Resolution, Shaping, Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer,
@@ -25,7 +26,7 @@ use crate::quad::{Quad, QuadPipeline};
 use crate::session::{Session, TermSize};
 use crate::theme::{linear_rgba, Rgb8, Theme};
 use crate::themes;
-use crate::ui::Layout;
+use crate::ui::{self, Layout};
 
 /// Inset between the grid and its container, in logical pixels.
 pub const PADDING: f32 = 8.0;
@@ -56,13 +57,16 @@ struct Span {
     flags: Flags,
 }
 
-/// A single line of chrome text, positioned in physical pixels.
+/// A single line of chrome text, positioned in physical pixels. Font size and
+/// line height are logical, scaled when the buffer is shaped.
 struct Label {
     text: String,
     x: f32,
     y: f32,
     max_width: f32,
     color: Rgb8,
+    font_size: f32,
+    line_height: f32,
 }
 
 pub struct Renderer {
@@ -90,6 +94,8 @@ pub struct Renderer {
 
     font_family: String,
     base_font_size: f32,
+    /// User-resizable sidebar width, in logical pixels.
+    sidebar_logical: f32,
     pub metrics: CellMetrics,
     pub theme: Theme,
     pub layout: Layout,
@@ -170,12 +176,13 @@ impl Renderer {
             spans: Vec::new(),
             font_family,
             base_font_size: font_size,
+            sidebar_logical: ui::SIDEBAR_DEFAULT,
             metrics,
             theme: Theme::new(
                 themes::resolve(themes::DEFAULT_DARK).unwrap_or_default(),
                 MIN_CONTRAST,
             ),
-            layout: Layout::new(scale),
+            layout: Layout::new(scale, ui::SIDEBAR_DEFAULT),
             scale,
             window,
         }
@@ -200,7 +207,7 @@ impl Renderer {
             return;
         }
         self.scale = scale;
-        self.layout = Layout::new(scale);
+        self.layout = Layout::new(scale, self.sidebar_logical);
         self.metrics = measure_cell(
             &mut self.font_system,
             &self.font_family,
@@ -209,6 +216,19 @@ impl Renderer {
         self.grid_buf = new_grid_buffer(&mut self.font_system, self.metrics);
         // Chrome buffers are rebuilt with the new metrics on the next frame.
         self.chrome_bufs.clear();
+    }
+
+    /// Sets the sidebar width from a logical-pixel value, clamped by
+    /// `Layout`. Returns whether the effective width actually changed, so the
+    /// caller can skip re-laying out the ptys when dragging past a limit.
+    pub fn set_sidebar_width(&mut self, logical: f32) -> bool {
+        let clamped = logical.clamp(ui::SIDEBAR_MIN, ui::SIDEBAR_MAX);
+        if (clamped - self.sidebar_logical).abs() < 0.5 {
+            return false;
+        }
+        self.sidebar_logical = clamped;
+        self.layout = Layout::new(self.scale, clamped);
+        true
     }
 
     /// Applies the light or dark palette to match system appearance.
@@ -321,7 +341,7 @@ impl Renderer {
                     left: label.x as i32,
                     top: label.y as i32,
                     right: (label.x + label.max_width) as i32,
-                    bottom: (label.y + CHROME_LINE_HEIGHT * 2.0 * self.scale) as i32,
+                    bottom: (label.y + label.line_height * 1.5 * self.scale) as i32,
                 },
                 default_color: TextColor::rgb(label.color[0], label.color[1], label.color[2]),
                 custom_glyphs: &[],
@@ -618,15 +638,16 @@ impl Renderer {
             linear_rgba(chrome.border, 1.0),
         ));
 
-        let text_offset = (layout.row_height - CHROME_LINE_HEIGHT * scale) / 2.0;
         let label_x = layout.side_margin + layout.dot_inset + layout.dot_active + 8.0 * scale;
 
         labels.push(Label {
             text: "+  New Tab".to_string(),
             x: label_x,
-            y: layout.new_tab_y() + (layout.new_tab_height - CHROME_LINE_HEIGHT * scale) / 2.0,
+            y: layout.new_tab_y() + (layout.new_tab_height - ui::LABEL_LINE * scale) / 2.0,
             max_width: layout.row_width(),
             color: chrome.text_tertiary,
+            font_size: ui::LABEL_SIZE,
+            line_height: ui::LABEL_LINE,
         });
 
         for (index, session) in sessions.iter().enumerate() {
@@ -668,7 +689,7 @@ impl Renderer {
             }
 
             // Activity, by dot form.
-            let center_y = row_y + layout.row_height / 2.0;
+            let center_y = row_y + layout.row_text_top + layout.label_line / 2.0;
             let dot_x = row_x + layout.dot_inset;
             match session.activity {
                 Activity::Idle => {
@@ -709,46 +730,75 @@ impl Renderer {
                 },
             }
 
+            let text_width = (row_w - layout.close_width - label_x + row_x).max(1.0);
+
             labels.push(Label {
                 text: session.label().to_string(),
                 x: label_x,
-                y: row_y + text_offset,
-                max_width: (row_w - layout.close_width - label_x + row_x).max(1.0),
+                y: row_y + layout.row_text_top,
+                max_width: text_width,
                 color: if is_active || session.needs_attention {
                     chrome.text_primary
                 } else {
                     chrome.text_secondary
                 },
+                font_size: ui::LABEL_SIZE,
+                line_height: ui::LABEL_LINE,
             });
+
+            // Second line: what this tab is actually doing. Kept on the
+            // dimmest token so the sidebar still reads calm and the attention
+            // pulse remains the only loud thing in it.
+            let summary = session.summary();
+            if !summary.is_empty() {
+                labels.push(Label {
+                    text: summary.to_string(),
+                    x: label_x,
+                    y: row_y + layout.row_text_top + layout.label_line,
+                    max_width: text_width,
+                    color: chrome.text_tertiary,
+                    font_size: ui::SUMMARY_SIZE,
+                    line_height: ui::SUMMARY_LINE,
+                });
+            }
 
             labels.push(Label {
                 text: "\u{00d7}".to_string(),
                 x: row_x + row_w - layout.close_width + 6.0 * scale,
-                y: row_y + text_offset,
+                y: row_y + layout.row_text_top,
                 max_width: layout.close_width,
                 color: chrome.text_tertiary,
+                font_size: ui::LABEL_SIZE,
+                line_height: ui::LABEL_LINE,
             });
         }
     }
 
     /// Shapes chrome labels, growing the buffer pool as tabs are added.
     fn sync_chrome_buffers(&mut self) {
-        let metrics = Metrics::new(
+        let fallback = Metrics::new(
             CHROME_FONT_SIZE * self.scale,
             CHROME_LINE_HEIGHT * self.scale,
         );
 
         while self.chrome_bufs.len() < self.labels.len() {
-            let mut buffer = TextBuffer::new(&mut self.font_system, metrics);
+            let mut buffer = TextBuffer::new(&mut self.font_system, fallback);
             buffer.set_wrap(Wrap::None);
+            // Trailing ellipsis at the real pixel width, rather than clipping
+            // a glyph in half at the row edge.
+            buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
             self.chrome_bufs.push(buffer);
         }
         self.chrome_bufs.truncate(self.labels.len());
 
         let attrs = Attrs::new().family(Family::SansSerif);
         for (label, buffer) in self.labels.iter().zip(self.chrome_bufs.iter_mut()) {
+            let metrics = Metrics::new(
+                label.font_size * self.scale,
+                label.line_height * self.scale,
+            );
             buffer.set_metrics(metrics);
-            buffer.set_size(Some(label.max_width), Some(metrics.line_height * 2.0));
+            buffer.set_size(Some(label.max_width), Some(metrics.line_height * 1.5));
             buffer.set_text(&label.text, &attrs, Shaping::Advanced, None);
             buffer.shape_until_scroll(&mut self.font_system, false);
         }

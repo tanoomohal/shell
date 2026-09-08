@@ -12,6 +12,8 @@ use crate::theme::{Rgb8, TerminalPalette};
 pub const DEFAULT_DARK: &str = "prism";
 pub const DEFAULT_LIGHT: &str = "prism-light";
 
+/// Selectable in the settings UI.
+#[allow(dead_code)]
 pub const BUILTIN_NAMES: &[&str] = &["prism", "prism-light", "graphite"];
 
 /// "Prism" — sampled from the app icon: near-black with a blue cast, a
