@@ -35,6 +35,19 @@ So a candidate name has to persist across consecutive polls before it's
 adopted, and once a tab is identified as an agent it keeps that identity until
 control returns to the shell.
 
+The name itself comes from the executable's *path*, not the kernel's process
+name. Tools are routinely installed as a version-named file behind a symlink —
+Claude Code lives at `~/.local/share/claude/versions/2.1.263`, which the kernel
+reports as `2.1.263` — so the path is walked upward past version numbers and
+generic directories to recover `claude`.
+
+Activity is derived the same way, from content rather than from raw output.
+Keying off "has the pty produced output recently" does not work, because agent
+TUIs repaint constantly while idle: a spinner advances, an elapsed timer ticks.
+Each poll instead fingerprints the visible grid with that churn normalized out,
+so a tab is quiet only once its actual content holds still. When the running
+tool advertises sub-agents in its own status line, that count is shown too.
+
 ## Design
 
 **Native geometry, authored state layer.** Real window chrome — traffic
@@ -91,26 +104,37 @@ Regenerate icons from source artwork with
 
 ## Keys
 
+`Cmd` on macOS, `Ctrl+Shift` elsewhere.
+
 | | |
 |---|---|
-| `Cmd/Ctrl+Shift` `T` | New tab |
-| `Cmd/Ctrl+Shift` `W` | Close tab |
-| `Cmd/Ctrl+Shift` `1`–`9` | Jump to tab |
-| `Cmd/Ctrl+Shift` `[` `]` | Cycle tabs |
+| `T` / `W` | New tab / close tab |
+| `1`–`9` | Jump to tab |
+| `[` `]` / `Tab` | Cycle tabs |
+| `C` / `V` | Copy / paste |
+| `A` | Select all |
+| `K` | Clear screen and scrollback |
+| `+` `-` `0` | Font size up, down, reset |
+
+Click to place the cursor, drag to select; double-click selects a word,
+triple-click a line. Drag the sidebar's right edge to resize it.
 
 ## Status
 
 Working: truecolor and 256-color, bold/italic/inverse/dim, box drawing, all
 cursor shapes, 10k-line scrollback, xterm-correct key encoding including
-modifier parameters and application cursor mode, resize, HiDPI, sidebar tabs
-with agent detection and attention state, theme system with system-appearance
-following.
+modifier parameters and application cursor mode, resize, HiDPI, copy and
+paste with bracketed-paste hardening, OSC 52, mouse selection by character,
+word and line, font zoom, resizable sidebar, per-tab output summaries, agent
+detection with attention state and sub-agent counts, and a theme system that
+follows system appearance.
 
-Not yet: copy/paste, mouse selection, command palette, split panes, session
-persistence, configurable font and keybindings. CJK wide characters get one
-cell of advance instead of two, and the grid re-shapes each frame rather than
-caching glyphs per cell — fine at current redraw-on-demand rates, but it wants
-attention before splits multiply the work.
+Not yet: a settings UI, multiple windows, command palette, split panes,
+session persistence, search, and mouse reporting to programs that request it.
+Selection is not yet exposed to the primary selection on Linux. CJK wide
+characters get one cell of advance instead of two, and the grid re-shapes each
+frame rather than caching glyphs per cell — fine at current redraw-on-demand
+rates, but it wants attention before splits multiply the work.
 
 ## Built on
 
