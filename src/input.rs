@@ -152,3 +152,93 @@ pub fn encode(
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::SmolStr;
+
+    fn ctrl() -> ModifiersState {
+        ModifiersState::CONTROL
+    }
+
+    fn key(c: &str) -> Key {
+        Key::Character(SmolStr::new(c))
+    }
+
+    /// Line-editing keys belong to the shell's own readline, not to this app.
+    /// These assertions exist to catch a future shortcut silently swallowing
+    /// one of them.
+    #[test]
+    fn readline_control_codes_pass_through() {
+        for (ch, code) in [
+            ("a", 0x01), // start of line
+            ("e", 0x05), // end of line
+            ("w", 0x17), // delete word backward
+            ("u", 0x15), // clear to start
+            ("k", 0x0b), // clear to end
+            ("r", 0x12), // reverse history search
+            ("c", 0x03), // interrupt
+            ("d", 0x04), // EOF
+            ("l", 0x0c), // clear
+            ("z", 0x1a), // suspend
+        ] {
+            let out = encode(&key(ch), None, ctrl(), false).expect(ch);
+            assert_eq!(out, vec![code], "ctrl+{ch} encoded wrong");
+        }
+    }
+
+    #[test]
+    fn tab_and_shift_tab_encode_for_completion() {
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Tab), None, ModifiersState::empty(), false),
+            Some(b"\t".to_vec())
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Tab), None, ModifiersState::SHIFT, false),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn history_arrows_encode_both_modes() {
+        let none = ModifiersState::empty();
+        // Normal mode: CSI. Application cursor mode: SS3.
+        assert_eq!(
+            encode(&Key::Named(NamedKey::ArrowUp), None, none, false),
+            Some(b"\x1b[1A".to_vec())
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::ArrowUp), None, none, true),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::ArrowDown), None, none, false),
+            Some(b"\x1b[1B".to_vec())
+        );
+    }
+
+    #[test]
+    fn modified_arrows_carry_an_xterm_modifier_parameter() {
+        // Alt+Left is word-back in many shells; the parameter must be 1+2.
+        assert_eq!(
+            encode(&Key::Named(NamedKey::ArrowLeft), None, ModifiersState::ALT, false),
+            Some(b"\x1b[1;3D".to_vec())
+        );
+    }
+
+    #[test]
+    fn composed_text_is_preferred_over_the_logical_key() {
+        // What makes dead keys and IME work.
+        let out = encode(&key("e"), Some("é"), ModifiersState::empty(), false);
+        assert_eq!(out, Some("é".as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn alt_prefixes_with_escape_rather_than_setting_the_high_bit() {
+        assert_eq!(
+            encode(&key("b"), Some("b"), ModifiersState::ALT, false),
+            Some(vec![0x1b, b'b'])
+        );
+    }
+}

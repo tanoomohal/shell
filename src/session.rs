@@ -168,6 +168,18 @@ impl Session {
         &self.summary
     }
 
+    /// Text of one grid row, for link detection. Empty if that line has
+    /// scrolled out of the buffer since the caller resolved it.
+    pub fn row_text(&self, line: Line) -> String {
+        let term = self.term.lock();
+        let grid = term.grid();
+        if line < grid.topmost_line() || line >= Line(grid.screen_lines() as i32) {
+            return String::new();
+        }
+        let row = &grid[line];
+        (0..grid.columns()).map(|c| row[Column(c)].c).collect()
+    }
+
     pub fn agent_count(&self) -> Option<u32> {
         self.agent_count
     }

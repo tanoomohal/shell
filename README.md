@@ -4,8 +4,6 @@
   <p>A GPU-rendered terminal built around running several coding agents at once.</p>
 </div>
 
-![Shell](docs/screenshot.png)
-
 ## Why
 
 Running three or four agent CLIs in parallel is now normal, and terminals
@@ -112,29 +110,37 @@ Regenerate icons from source artwork with
 | `1`–`9` | Jump to tab |
 | `[` `]` / `Tab` | Cycle tabs |
 | `C` / `V` | Copy / paste |
+| `F` | Find in buffer *(not yet)* |
 | `A` | Select all |
 | `K` | Clear screen and scrollback |
 | `+` `-` `0` | Font size up, down, reset |
 
-Click to place the cursor, drag to select; double-click selects a word,
-triple-click a line. Drag the sidebar's right edge to resize it.
+Click and drag to select; double-click selects a word, triple-click a line.
+Hold the app modifier to light up URLs and click to open them. On Linux,
+selecting copies to the primary selection and middle-click pastes it. Drag the
+sidebar's right edge to resize it.
 
 ## Status
 
 Working: truecolor and 256-color, bold/italic/inverse/dim, box drawing, all
 cursor shapes, 10k-line scrollback, xterm-correct key encoding including
 modifier parameters and application cursor mode, resize, HiDPI, copy and
-paste with bracketed-paste hardening, OSC 52, mouse selection by character,
-word and line, font zoom, resizable sidebar, per-tab output summaries, agent
+paste with bracketed-paste hardening, OSC 52, primary selection and
+middle-click paste on Linux, mouse selection by character, word and line,
+clickable URLs, font zoom, resizable sidebar, per-tab output summaries, agent
 detection with attention state and sub-agent counts, and a theme system that
 follows system appearance.
 
-Not yet: a settings UI, multiple windows, command palette, split panes,
-session persistence, search, and mouse reporting to programs that request it.
-Selection is not yet exposed to the primary selection on Linux. CJK wide
-characters get one cell of advance instead of two, and the grid re-shapes each
-frame rather than caching glyphs per cell — fine at current redraw-on-demand
-rates, but it wants attention before splits multiply the work.
+Shell-side line editing — history, `Ctrl+R`, `Ctrl+A`/`E`/`W`/`U`/`K`, Tab
+completion — is the shell's own and passes through untouched. There are tests
+asserting exactly that, so a future shortcut can't quietly swallow one.
+
+Not yet: find-in-buffer, a settings UI, multiple windows, command palette,
+split panes, session persistence, and mouse reporting to programs that request
+it. CJK wide characters get one cell of advance instead of two, and the grid
+re-shapes each frame rather than caching glyphs per cell — fine at current
+redraw-on-demand rates, but it wants attention before splits multiply the
+work.
 
 ## Built on
 

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::CursorShape;
@@ -89,6 +89,9 @@ pub struct Renderer {
     chrome_bufs: Vec<TextBuffer>,
     labels: Vec<Label>,
 
+    /// Grid line and column range of the link under the cursor, if any.
+    link: Option<(Line, std::ops::Range<usize>)>,
+
     quads: QuadPipeline,
     under: Vec<Quad>,
     over: Vec<Quad>,
@@ -172,6 +175,7 @@ impl Renderer {
             grid_buf,
             chrome_bufs: Vec::new(),
             labels: Vec::new(),
+            link: None,
             quads,
             under: Vec::new(),
             over: Vec::new(),
@@ -245,6 +249,15 @@ impl Renderer {
 
         let point = viewport_to_point(display_offset, Point::new(line, Column(column)));
         (point, side)
+    }
+
+    /// Sets the link to underline. Returns whether it changed.
+    pub fn set_link(&mut self, link: Option<(Line, std::ops::Range<usize>)>) -> bool {
+        if link == self.link {
+            return false;
+        }
+        self.link = link;
+        true
     }
 
     /// Changes the terminal font size, remeasuring the cell grid.
@@ -500,6 +513,7 @@ impl Renderer {
             font_family,
             metrics,
             theme,
+            link,
             ..
         } = self;
 
@@ -632,6 +646,22 @@ impl Renderer {
                     },
                     CursorShape::Hidden => {},
                 }
+            }
+        }
+
+        // Underline the hovered link, in the text color so it reads as part
+        // of the text rather than as chrome.
+        if let Some((line, range)) = link.clone() {
+            if let Some(vp) = point_to_viewport(display_offset, Point::new(line, Column(range.start)))
+            {
+                let thickness = (metrics.height / 16.0).max(1.0).round();
+                over.push(Quad::new(
+                    grid_x + vp.column.0 as f32 * metrics.width,
+                    grid_y + vp.line as f32 * metrics.height + metrics.height - thickness,
+                    range.len() as f32 * metrics.width,
+                    thickness,
+                    linear_rgba(theme_fg, 1.0),
+                ));
             }
         }
 

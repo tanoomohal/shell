@@ -4,6 +4,7 @@
 mod agent;
 mod clipboard;
 mod input;
+mod links;
 mod quad;
 mod renderer;
 mod session;
@@ -85,6 +86,8 @@ struct State {
     /// Set while a text selection is being dragged out in the grid.
     selecting: bool,
     last_click: Option<(Instant, PhysicalPosition<f64>)>,
+    /// Link under the cursor while the app modifier is held.
+    hovered_link: Option<(Line, std::ops::Range<usize>, String)>,
     click_count: u32,
     clipboard: Clipboard,
     /// Clock for the attention pulse.
@@ -166,6 +169,54 @@ impl State {
         if let Some(text) = text.filter(|t| !t.is_empty()) {
             self.clipboard.set(&text);
         }
+    }
+
+    /// Copy-on-select, for the primary selection only. Following the X11
+    /// convention here does not disturb the ordinary clipboard.
+    fn copy_selection_to_primary(&mut self) {
+        let text = self.active_session().term.lock().selection_to_string();
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            self.clipboard.set_primary(&text);
+        }
+    }
+
+    fn paste_primary(&mut self) {
+        let Some(text) = self.clipboard.get_primary() else {
+            return;
+        };
+        paste_into(&self.sessions[self.active], &text);
+        self.renderer.window().request_redraw();
+    }
+
+    /// Link under the cursor, resolved against the row it is over.
+    fn link_at(
+        &self,
+        position: PhysicalPosition<f64>,
+    ) -> Option<(Line, std::ops::Range<usize>, String)> {
+        let (point, _) = self.point_at(position);
+        let text = self.active_session().row_text(point.line);
+        let (range, url) = links::find_url_at(&text, point.column.0)?;
+        Some((point.line, range, url))
+    }
+
+    /// Recomputes the hovered link. Links only light up while the app
+    /// modifier is held, so ordinary dragging still selects text over them.
+    fn update_hovered_link(&mut self, position: PhysicalPosition<f64>) -> bool {
+        let next = if is_app_modifier(self.mods) {
+            self.link_at(position)
+        } else {
+            None
+        };
+        let key = |l: &Option<(Line, std::ops::Range<usize>, String)>| {
+            l.as_ref().map(|(line, range, _)| (*line, range.clone()))
+        };
+        if key(&next) == key(&self.hovered_link) {
+            return false;
+        }
+        self.renderer
+            .set_link(key(&next));
+        self.hovered_link = next;
+        true
     }
 
     fn paste(&mut self) {
@@ -322,6 +373,7 @@ impl ApplicationHandler<UserEvent> for App {
             dragging_divider: false,
             selecting: false,
             last_click: None,
+            hovered_link: None,
             click_count: 0,
             clipboard: Clipboard::new(),
             started: Instant::now(),
@@ -359,7 +411,13 @@ impl ApplicationHandler<UserEvent> for App {
                 state.renderer.window().request_redraw();
             },
 
-            WindowEvent::ModifiersChanged(mods) => state.mods = mods.state(),
+            WindowEvent::ModifiersChanged(mods) => {
+                state.mods = mods.state();
+                let cursor = state.cursor;
+                if state.update_hovered_link(cursor) {
+                    state.renderer.window().request_redraw();
+                }
+            },
 
             WindowEvent::CursorMoved { position, .. } => {
                 state.cursor = position;
@@ -386,6 +444,10 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                if state.update_hovered_link(position) {
+                    state.renderer.window().request_redraw();
+                }
+
                 let over_divider = matches!(
                     state.renderer.layout.hit_test(
                         position.x as f32,
@@ -396,6 +458,8 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 state.renderer.window().set_cursor(if over_divider {
                     CursorIcon::ColResize
+                } else if state.hovered_link.is_some() {
+                    CursorIcon::Pointer
                 } else {
                     CursorIcon::Default
                 });
@@ -407,8 +471,17 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 state.dragging_divider = false;
-                state.selecting = false;
+                if state.selecting {
+                    state.selecting = false;
+                    state.copy_selection_to_primary();
+                }
             },
+
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => state.paste_primary(),
 
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -435,6 +508,11 @@ impl ApplicationHandler<UserEvent> for App {
                     },
                     Hit::Divider => state.dragging_divider = true,
                     Hit::Grid => {
+                        if let Some((_, _, url)) = state.hovered_link.clone() {
+                            links::open(&url);
+                            return;
+                        }
+
                         let now = Instant::now();
                         let is_multi = state.last_click.is_some_and(|(at, pos)| {
                             now.duration_since(at) < MULTI_CLICK_WINDOW
