@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Shell
+GenericName=Terminal
+Comment=A GPU-rendered terminal built for running coding agents
+Exec=shell
+Icon=shell
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;prompt;command;agent;
+StartupWMClass=shell

@@ -1,0 +1,29 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+# Terminal emulation core: VTE parser, grid, scrollback, and pty event loop.
+alacritty_terminal = "0.26"
+
+# Windowing + GPU rendering. glyphon pins wgpu ^30, so keep them in lockstep.
+winit = "0.30"
+wgpu = "30.0"
+glyphon = "0.12"
+pollster = "0.4"
+
+# Config and session persistence.
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+dirs = "7"
+
+libc = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
