@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
+use alacritty_terminal::index::{Column, Point, Side};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::point_to_viewport;
+use alacritty_terminal::term::{point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::CursorShape;
 use glyphon::cosmic_text::{Ellipsize, EllipsizeHeightLimit};
 use glyphon::{
@@ -30,6 +31,8 @@ use crate::ui::{self, Layout};
 
 /// Inset between the grid and its container, in logical pixels.
 pub const PADDING: f32 = 8.0;
+pub const MIN_FONT_SIZE: f32 = 6.0;
+pub const MAX_FONT_SIZE: f32 = 48.0;
 /// Minimum WCAG contrast enforced between cell text and its background.
 /// Agent CLIs lean on dim grays chosen against some other background, so a
 /// floor here is what keeps them readable under an arbitrary theme.
@@ -216,6 +219,51 @@ impl Renderer {
         self.grid_buf = new_grid_buffer(&mut self.font_system, self.metrics);
         // Chrome buffers are rebuilt with the new metrics on the next frame.
         self.chrome_bufs.clear();
+    }
+
+    /// Maps a physical cursor position to a grid point plus which half of the
+    /// cell it fell in, which is what selection needs to decide whether a
+    /// boundary cell is included.
+    pub fn grid_point(
+        &self,
+        x: f32,
+        y: f32,
+        grid: TermSize,
+        display_offset: usize,
+    ) -> (Point, Side) {
+        let (origin_x, origin_y) = self.grid_origin(grid);
+        let col_f = ((x - origin_x) / self.metrics.width).max(0.0);
+        let line_f = ((y - origin_y) / self.metrics.height).max(0.0);
+
+        let column = (col_f.floor() as usize).min(grid.columns.saturating_sub(1));
+        let line = (line_f.floor() as usize).min(grid.screen_lines.saturating_sub(1));
+        let side = if col_f.fract() >= 0.5 {
+            Side::Right
+        } else {
+            Side::Left
+        };
+
+        let point = viewport_to_point(display_offset, Point::new(line, Column(column)));
+        (point, side)
+    }
+
+    /// Changes the terminal font size, remeasuring the cell grid.
+    pub fn set_font_size(&mut self, logical: f32) {
+        let clamped = logical.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        if (clamped - self.base_font_size).abs() < 0.01 {
+            return;
+        }
+        self.base_font_size = clamped;
+        self.metrics = measure_cell(
+            &mut self.font_system,
+            &self.font_family,
+            clamped * self.scale,
+        );
+        self.grid_buf = new_grid_buffer(&mut self.font_system, self.metrics);
+    }
+
+    pub fn font_size(&self) -> f32 {
+        self.base_font_size
     }
 
     /// Sets the sidebar width from a logical-pixel value, clamped by
@@ -465,6 +513,9 @@ impl Renderer {
         let content = term.renderable_content();
         let display_offset = content.display_offset;
         let colors = content.colors;
+        let selection = content.selection;
+        let cursor_point = content.cursor.point;
+        let cursor_shape = content.cursor.shape;
 
         // Merge adjacent cells sharing a background color into one quad.
         let mut bg_run: Option<(usize, usize, usize, Rgb8)> = None; // row, start col, len, color
@@ -511,6 +562,12 @@ impl Renderer {
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            if selection
+                .is_some_and(|range| range.contains_cell(&indexed, cursor_point, cursor_shape))
+            {
+                bg = theme.palette.selection_bg;
+            }
+
             if cell.flags.contains(Flags::HIDDEN) {
                 fg = bg;
             } else {
@@ -730,7 +787,29 @@ impl Renderer {
                 },
             }
 
-            let text_width = (row_w - layout.close_width - label_x + row_x).max(1.0);
+            // A count badge, when the tool reports sub-agents of its own,
+            // sits between the label and the close button. Neutral, because
+            // hue belongs to identity.
+            let badge = session.agent_count().map(|n| n.to_string());
+            let badge_width = if badge.is_some() {
+                ui::BADGE_WIDTH * scale
+            } else {
+                0.0
+            };
+            let text_width =
+                (row_w - layout.close_width - badge_width - label_x + row_x).max(1.0);
+
+            if let Some(badge) = badge {
+                labels.push(Label {
+                    text: badge,
+                    x: row_x + row_w - layout.close_width - badge_width,
+                    y: row_y + layout.row_text_top,
+                    max_width: badge_width,
+                    color: chrome.text_secondary,
+                    font_size: ui::SUMMARY_SIZE,
+                    line_height: ui::LABEL_LINE,
+                });
+            }
 
             labels.push(Label {
                 text: session.label().to_string(),

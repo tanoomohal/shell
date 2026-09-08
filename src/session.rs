@@ -1,6 +1,7 @@
 //! A single terminal session: the emulator state plus the pty feeding it.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::tty;
+use alacritty_terminal::tty::{self, Shell as PtyShell};
 use winit::event_loop::EventLoopProxy;
 
 use crate::agent::{self, Activity, ActivityTracker, AgentKind, LabelTracker};
@@ -78,6 +79,9 @@ pub struct Session {
     label: LabelTracker,
     /// Last meaningful line of output, shown under the tab's label.
     summary: String,
+    /// Number of sub-agents the tool in this tab reports running, scraped
+    /// from its own status line.
+    agent_count: Option<u32>,
     pub activity: Activity,
     /// Set when a background tab starts waiting on the user, cleared when the
     /// tab is next focused.
@@ -93,7 +97,7 @@ impl Session {
         proxy: &EventLoopProxy<UserEvent>,
     ) -> io::Result<Self> {
         let pty_options = tty::Options {
-            shell: None,
+            shell: startup_command(),
             working_directory: dirs::home_dir(),
             drain_on_exit: false,
             env: HashMap::new(),
@@ -131,6 +135,7 @@ impl Session {
             title: String::new(),
             label: LabelTracker::new(shell_name()),
             summary: String::new(),
+            agent_count: None,
             activity: Activity::Idle,
             needs_attention: false,
             tracker: ActivityTracker::default(),
@@ -163,48 +168,66 @@ impl Session {
         &self.summary
     }
 
-    /// Re-reads the tab's last meaningful line of output. Returns whether it
-    /// changed.
+    pub fn agent_count(&self) -> Option<u32> {
+        self.agent_count
+    }
+
+    /// Reads everything the sidebar needs from the grid in one pass:
+    /// the summary line, a change fingerprint, and any sub-agent count the
+    /// running tool advertises.
     ///
-    /// Scans the viewport bottom-up and takes the first line that survives
-    /// `summarize_line`. The cursor's own line is skipped: for a shell sitting
-    /// at an empty prompt that line *is* the prompt, and the useful summary is
-    /// the output above it.
-    pub fn refresh_summary(&mut self) -> bool {
-        let next = {
+    /// Returns whether anything displayed changed.
+    fn refresh_from_grid(&mut self) -> (bool, u64) {
+        let (summary, fingerprint, agent_count) = {
             let term = self.term.lock();
             let grid = term.grid();
             let cursor_line = grid.cursor.point.line;
             let columns = grid.columns();
 
-            let mut found = None;
-            for index in (0..grid.screen_lines()).rev() {
-                let line = Line(index as i32);
-                if line == cursor_line {
-                    continue;
-                }
-                let row = &grid[line];
+            let mut hasher = DefaultHasher::new();
+            let mut rows: Vec<String> = Vec::with_capacity(grid.screen_lines());
+            for index in 0..grid.screen_lines() {
+                let row = &grid[Line(index as i32)];
                 let mut raw = String::with_capacity(columns);
                 for column in 0..columns {
                     raw.push(row[Column(column)].c);
                 }
-                if let Some(summary) = summarize_line(&raw) {
-                    found = Some(summary);
+                for c in raw.chars() {
+                    if let Some(normalized) = fingerprint_char(c) {
+                        normalized.hash(&mut hasher);
+                    }
+                }
+                rows.push(raw);
+            }
+
+            // Both the summary and the status line live near the bottom.
+            let mut summary = None;
+            let mut agent_count = None;
+            for index in (0..rows.len()).rev() {
+                if agent_count.is_none() {
+                    agent_count = parse_agent_count(&rows[index]);
+                }
+                if summary.is_none() && Line(index as i32) != cursor_line {
+                    summary = summarize_line(&rows[index]);
+                }
+                if summary.is_some() && agent_count.is_some() {
                     break;
                 }
             }
-            found.unwrap_or_default()
+
+            (summary.unwrap_or_default(), hasher.finish(), agent_count)
         };
 
-        if next == self.summary {
-            return false;
+        let mut changed = false;
+        if summary != self.summary {
+            self.summary = summary;
+            changed = true;
         }
-        self.summary = next;
-        true
-    }
-
-    pub fn mark_output(&mut self) {
-        self.tracker.mark_output();
+        if agent_count != self.agent_count {
+            self.agent_count = agent_count;
+            changed = true;
+        }
+        (changed, fingerprint)
     }
 
     /// Re-reads the pty's foreground process and recomputes activity.
@@ -216,8 +239,9 @@ impl Session {
             return false;
         };
         let mut changed = self.label.observe(&name);
-        changed |= self.refresh_summary();
-        let activity = self.tracker.activity(self.label.kind());
+        let (grid_changed, fingerprint) = self.refresh_from_grid();
+        changed |= grid_changed;
+        let activity = self.tracker.observe(fingerprint, self.label.kind());
 
         if activity != self.activity {
             // Only a fresh transition into Waiting raises attention, so
@@ -369,4 +393,69 @@ mod tests {
             Some("Waiting for your input")
         );
     }
+}
+
+/// Program a new tab launches instead of the login shell.
+///
+/// Read from `SHELL_COMMAND`, split on whitespace. This is the hook the
+/// settings UI will eventually write to, and it is what makes agent detection
+/// testable without driving the GUI.
+fn startup_command() -> Option<PtyShell> {
+    let raw = std::env::var("SHELL_COMMAND").ok()?;
+    let mut parts = raw.split_whitespace().map(str::to_string);
+    let program = parts.next()?;
+    Some(PtyShell::new(program, parts.collect()))
+}
+
+/// Normalizes one grid character for the change fingerprint, or drops it.
+///
+/// Everything that an idle-but-repainting TUI animates is removed: spinner
+/// frames and rules are decoration, layout churn is whitespace, and elapsed
+/// timers and token counters are digits. What survives is the text content, so
+/// a fingerprint only moves when something the user would call progress does.
+fn fingerprint_char(c: char) -> Option<char> {
+    if c.is_whitespace() || is_decoration(c) {
+        return None;
+    }
+    if c.is_ascii_digit() {
+        return Some('0');
+    }
+    Some(c)
+}
+
+/// Scrapes a sub-agent count out of a tool's own status line, e.g. the
+/// `1 agent` that Claude Code prints while a subagent is running.
+fn parse_agent_count(line: &str) -> Option<u32> {
+    let lower = line.to_ascii_lowercase();
+    let mut found = None;
+    let mut cursor = 0;
+
+    while let Some(offset) = lower[cursor..].find("agent") {
+        let at = cursor + offset;
+        cursor = at + "agent".len();
+
+        // Require a word boundary, so "agentic" doesn't match.
+        let next = lower[cursor..].chars().next();
+        let boundary = matches!(next, None | Some('s'))
+            || next.is_some_and(|c| !c.is_alphanumeric());
+        if !boundary {
+            continue;
+        }
+
+        // Walk back over the separator, then collect the digits before it.
+        let digits: String = lower[..at]
+            .trim_end()
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            continue;
+        }
+        if let Ok(count) = digits.chars().rev().collect::<String>().parse::<u32>() {
+            found = Some(count);
+        }
+    }
+
+    found
 }

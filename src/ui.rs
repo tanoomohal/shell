@@ -18,6 +18,8 @@ pub const NEW_TAB_HEIGHT: f32 = 26.0;
 pub const NEW_TAB_GAP: f32 = 8.0;
 /// Width of the clickable close-button area at the right edge of a row.
 pub const CLOSE_WIDTH: f32 = 22.0;
+/// Space reserved for the sub-agent count badge.
+pub const BADGE_WIDTH: f32 = 16.0;
 pub const DOT_INSET: f32 = 11.0;
 /// Accent bar shown on rows whose agent is waiting on you.
 pub const ACCENT_WIDTH: f32 = 2.0;

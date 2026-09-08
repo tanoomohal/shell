@@ -6,13 +6,9 @@
 //! spoofed by a program setting its own window title.
 
 use std::os::fd::RawFd;
-use std::time::{Duration, Instant};
+use std::path::Path;
 
 use crate::theme::Rgb8;
-
-/// How long a pty has to stay quiet before an agent running in it is treated
-/// as waiting on the user rather than still working.
-const QUIET_BEFORE_WAITING: Duration = Duration::from_millis(700);
 
 const SHELL_NAMES: &[&str] = &["sh", "zsh", "bash", "fish", "dash", "ksh", "tcsh", "csh", "nu"];
 
@@ -142,29 +138,48 @@ impl LabelTracker {
     }
 }
 
-/// Tracks output timing so `Activity` can be derived without polling the OS
-/// for process state, which differs too much between platforms to trust.
+/// Derives `Activity` from whether the tab's visible content is *meaningfully*
+/// changing.
+///
+/// The obvious signal — "has the pty produced output recently" — does not
+/// work. Agent TUIs repaint constantly even while idle: a spinner frame
+/// advances, an elapsed-time counter ticks, a token count creeps up. A tab
+/// running one would read as busy forever and never announce that it is
+/// waiting on you.
+///
+/// So each poll fingerprints the visible grid with the churn normalized out
+/// (see `session::grid_fingerprint`), and a tab counts as quiet only once that
+/// fingerprint holds still.
 pub struct ActivityTracker {
-    last_output: Instant,
+    fingerprint: u64,
+    stable_polls: u32,
 }
+
+/// Consecutive unchanged polls before a tab is considered quiet.
+const STABLE_POLLS_BEFORE_QUIET: u32 = 2;
 
 impl Default for ActivityTracker {
     fn default() -> Self {
         Self {
-            last_output: Instant::now(),
+            fingerprint: 0,
+            stable_polls: 0,
         }
     }
 }
 
 impl ActivityTracker {
-    pub fn mark_output(&mut self) {
-        self.last_output = Instant::now();
-    }
+    pub fn observe(&mut self, fingerprint: u64, kind: AgentKind) -> Activity {
+        if fingerprint != self.fingerprint {
+            self.fingerprint = fingerprint;
+            self.stable_polls = 0;
+            return Activity::Working;
+        }
 
-    pub fn activity(&self, kind: AgentKind) -> Activity {
-        if self.last_output.elapsed() < QUIET_BEFORE_WAITING {
-            Activity::Working
-        } else if kind.is_agent() {
+        self.stable_polls = self.stable_polls.saturating_add(1);
+        if self.stable_polls < STABLE_POLLS_BEFORE_QUIET {
+            return Activity::Working;
+        }
+        if kind.is_agent() {
             Activity::Waiting
         } else {
             Activity::Idle
@@ -172,23 +187,102 @@ impl ActivityTracker {
     }
 }
 
+/// Directory names that say nothing about what a program is.
+const GENERIC_DIRS: &[&str] = &[
+    "versions", "version", "bin", "sbin", "libexec", "current", "latest", "releases", "release",
+    "dist", "build", "target", "node_modules", "share", "lib", "local", "opt", "usr", "cellar",
+    "contents", "macos", "resources", ".local",
+];
+
+/// True for strings that are only a version, like `2.1.263` or `1.0-rc2`.
+fn looks_like_version(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().any(|c| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '_')
+}
+
+/// Derives a human-meaningful program name from an executable path.
+///
+/// Necessary because tools are routinely installed as a version-named file
+/// behind a symlink — Claude Code lives at
+/// `~/.local/share/claude/versions/2.1.263`, so the kernel reports the process
+/// name as `2.1.263`. Walking up past version numbers and generic directories
+/// recovers `claude`.
+pub fn derive_name(path: &Path) -> Option<String> {
+    let parts: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .filter(|c| *c != "/")
+        .collect();
+
+    for part in parts.iter().rev() {
+        if looks_like_version(part) {
+            continue;
+        }
+        if GENERIC_DIRS.contains(&part.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        // Trim an extension, so `foo.exe` and `foo.app` read as `foo`.
+        let trimmed = part.split('.').next().unwrap_or(part);
+        if trimmed.is_empty() {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
 /// Name of the process currently in the foreground of the pty.
 ///
 /// Returns `None` when the process can't be identified rather than guessing.
 /// That happens routinely: a freshly spawned tab's foreground process is
-/// `login`, which is setuid root, and `proc_name` refuses to report on it.
-/// Callers should keep their previous value in that case.
+/// `login`, which is setuid root and refuses to report. Callers should keep
+/// their previous value in that case.
 pub fn foreground_process_name(master_fd: RawFd) -> Option<String> {
     let pgid = unsafe { libc::tcgetpgrp(master_fd) };
-    let name = if pgid > 0 { process_name(pgid) } else { None };
+    if pgid <= 0 {
+        return None;
+    }
+
+    // The executable path is preferred over the kernel's process name, which
+    // is just the file's own basename and so is often a version number.
+    let name = process_path(pgid)
+        .as_deref()
+        .and_then(derive_name)
+        .or_else(|| process_name(pgid));
+
     log::trace!("fd {master_fd}: pgid={pgid} name={name:?}");
     name
 }
 
 #[cfg(target_os = "macos")]
+fn process_path(pid: i32) -> Option<std::path::PathBuf> {
+    // `proc_pidpath` lives in libproc, part of libSystem. libc doesn't
+    // declare it.
+    extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut libc::c_char, buffersize: u32) -> i32;
+    }
+    // PROC_PIDPATHINFO_MAXSIZE
+    const MAX: usize = 4096;
+
+    let mut buf = vec![0 as libc::c_char; MAX];
+    let len = unsafe { proc_pidpath(pid, buf.as_mut_ptr(), MAX as u32) };
+    if len <= 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = buf[..len as usize].iter().map(|c| *c as u8).collect();
+    String::from_utf8(bytes).ok().map(std::path::PathBuf::from)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_path(pid: i32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(target_os = "macos")]
 fn process_name(pid: i32) -> Option<String> {
-    // `proc_name` lives in libproc, which is part of libSystem, so it needs no
-    // extra link flags. libc doesn't declare it.
     extern "C" {
         fn proc_name(pid: i32, buffer: *mut libc::c_char, buffersize: u32) -> i32;
     }
@@ -204,7 +298,6 @@ fn process_name(pid: i32) -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn process_name(pid: i32) -> Option<String> {
-    // Linux and the other unixes with procfs.
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     let name = comm.trim();
     if name.is_empty() {
@@ -217,6 +310,45 @@ fn process_name(pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derives_name_past_version_directories() {
+        // The case that broke agent detection: Claude Code installed as a
+        // version-named file behind a symlink.
+        assert_eq!(
+            derive_name(Path::new(
+                "/Users/me/.local/share/claude/versions/2.1.263"
+            ))
+            .as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn derives_name_for_ordinary_paths() {
+        assert_eq!(derive_name(Path::new("/bin/zsh")).as_deref(), Some("zsh"));
+        assert_eq!(derive_name(Path::new("/usr/bin/vim")).as_deref(), Some("vim"));
+        assert_eq!(
+            derive_name(Path::new("/opt/homebrew/Cellar/node/22.1.0/bin/node")).as_deref(),
+            Some("node")
+        );
+    }
+
+    #[test]
+    fn derived_names_classify_correctly() {
+        let path = Path::new("/Users/me/.local/share/claude/versions/2.1.263");
+        let name = derive_name(path).unwrap();
+        assert_eq!(AgentKind::detect(&name), AgentKind::Claude);
+    }
+
+    #[test]
+    fn version_detection_does_not_eat_real_names() {
+        assert!(looks_like_version("2.1.263"));
+        assert!(looks_like_version("1.0-rc2".trim_end_matches("rc2")));
+        assert!(!looks_like_version("claude"));
+        assert!(!looks_like_version("python3"));
+        assert!(!looks_like_version(""));
+    }
 
     #[test]
     fn reads_own_process_name() {
@@ -293,6 +425,34 @@ mod tests {
         settle(&mut tracker, "claude");
         settle(&mut tracker, "codex");
         assert_eq!(tracker.kind(), AgentKind::Codex);
+    }
+
+    #[test]
+    fn repainting_agent_still_reaches_waiting() {
+        // A spinner and a timer change every frame, but they normalize away,
+        // so the fingerprint holds still and the tab settles into Waiting.
+        let mut tracker = ActivityTracker::default();
+        let steady = 0xabcd_1234u64;
+        assert_eq!(tracker.observe(steady, AgentKind::Claude), Activity::Working);
+        assert_eq!(tracker.observe(steady, AgentKind::Claude), Activity::Working);
+        assert_eq!(tracker.observe(steady, AgentKind::Claude), Activity::Waiting);
+    }
+
+    #[test]
+    fn changing_content_keeps_an_agent_working() {
+        let mut tracker = ActivityTracker::default();
+        for i in 0..6u64 {
+            assert_eq!(tracker.observe(i, AgentKind::Claude), Activity::Working);
+        }
+    }
+
+    #[test]
+    fn quiet_shell_is_idle_not_waiting() {
+        let mut tracker = ActivityTracker::default();
+        let steady = 7u64;
+        tracker.observe(steady, AgentKind::Shell);
+        tracker.observe(steady, AgentKind::Shell);
+        assert_eq!(tracker.observe(steady, AgentKind::Shell), Activity::Idle);
     }
 
     #[test]
