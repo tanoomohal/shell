@@ -4,6 +4,7 @@
 //! reason for this terminal client, alongside instant fuzzy shell history search
 //! and terminal actions.
 
+use alacritty_terminal::grid::Dimensions;
 use crate::agent::AgentKind;
 use crate::session::Session;
 use crate::theme::Rgb8;
@@ -15,6 +16,10 @@ pub enum PaletteMode {
     Commands,
     /// Dedicated visual fuzzy history search. Triggered via Cmd+R.
     History,
+    /// Tab Inspector modal. Triggered via Cmd+I.
+    Inspector,
+    /// Tab Title rename modal. Triggered via Shift+Cmd+I.
+    EditTitle,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,10 +31,13 @@ pub enum PaletteAction {
     SwitchTab(usize),
     /// Spawn a new tab running an agent CLI or shell.
     SpawnAgent { name: String, command: Option<String> },
+    /// Rename tab title.
+    SetTitle(String),
     /// Terminal buffer action.
     ClearScrollback,
     FindInBuffer,
     Zoom(f32),
+    None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +47,7 @@ pub enum PaletteCategory {
     Prompt,     // 💬 Quick Agent Commands (/plan, /review, etc.)
     History,    // 📜 Shell History Search
     Action,     // ⚙️ Terminal Control
+    Info,       // ℹ️ Inspector Info
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +293,126 @@ impl PaletteState {
                     });
                 }
             },
+
+            PaletteMode::Inspector => {
+                if let Some(session) = sessions.get(active_tab) {
+                    let term = session.term.lock();
+                    let grid = term.grid();
+                    let total_lines = grid.total_lines();
+                    let cursor = grid.cursor.point;
+                    let display_offset = grid.display_offset();
+                    drop(term);
+
+                    items.push(PaletteItem {
+                        title: format!("Tab Name: {}", session.label()),
+                        subtitle: Some(format!(
+                            "Custom title: {}",
+                            session.custom_title.as_deref().unwrap_or("None (auto-derived)")
+                        )),
+                        badge: Some("TITLE".to_string()),
+                        icon_color: Some(session.agent().dot_color()),
+                        category: PaletteCategory::Info,
+                        action: PaletteAction::None,
+                    });
+
+                    items.push(PaletteItem {
+                        title: format!(
+                            "Terminal Dimensions: {} cols × {} rows",
+                            session.size.columns, session.size.screen_lines
+                        ),
+                        subtitle: Some(format!(
+                            "Total scrollback: {} lines (offset: {})",
+                            total_lines, display_offset
+                        )),
+                        badge: Some("GRID".to_string()),
+                        icon_color: Some([0x6c, 0x9e, 0xd9]),
+                        category: PaletteCategory::Info,
+                        action: PaletteAction::None,
+                    });
+
+                    items.push(PaletteItem {
+                        title: format!("Cursor Position: Row {}, Col {}", cursor.line.0, cursor.column.0),
+                        subtitle: Some("Zero-indexed buffer coordinates".to_string()),
+                        badge: Some("CURSOR".to_string()),
+                        icon_color: Some([0x8f, 0xc7, 0x7a]),
+                        category: PaletteCategory::Info,
+                        action: PaletteAction::None,
+                    });
+
+                    items.push(PaletteItem {
+                        title: format!("Agent Status: {:?}", session.agent()),
+                        subtitle: Some(if session.needs_attention {
+                            "Needs attention 🔔 (waiting on user)".to_string()
+                        } else if !session.summary().is_empty() {
+                            session.summary().to_string()
+                        } else {
+                            "Idle / in normal shell loop".to_string()
+                        }),
+                        badge: Some(
+                            if session.needs_attention {
+                                "ATTENTION"
+                            } else {
+                                "STATUS"
+                            }
+                            .to_string(),
+                        ),
+                        icon_color: Some(if session.needs_attention {
+                            [0xe5, 0x5f, 0x5f]
+                        } else {
+                            [0x8f, 0xc7, 0x7a]
+                        }),
+                        category: PaletteCategory::Info,
+                        action: PaletteAction::None,
+                    });
+
+                    items.push(PaletteItem {
+                        title: format!("PTY Process FD: {}", session.master_fd),
+                        subtitle: Some(format!(
+                            "OSC Title: {}",
+                            if session.title.is_empty() {
+                                "(empty)"
+                            } else {
+                                &session.title
+                            }
+                        )),
+                        badge: Some("PTY".to_string()),
+                        icon_color: Some([0xb5, 0x7e, 0xdc]),
+                        category: PaletteCategory::Info,
+                        action: PaletteAction::None,
+                    });
+                }
+            },
+
+            PaletteMode::EditTitle => {
+                let current_label = sessions.get(active_tab).map(|s| s.label()).unwrap_or("Tab");
+                let title_to_set = if self.query.trim().is_empty() {
+                    current_label.to_string()
+                } else {
+                    self.query.trim().to_string()
+                };
+                items.push(PaletteItem {
+                    title: format!("Set Tab Title to: \"{title_to_set}\""),
+                    subtitle: Some("Press Enter to save, or Esc to cancel".to_string()),
+                    badge: Some("RENAME".to_string()),
+                    icon_color: Some([0x8f, 0xc7, 0x7a]),
+                    category: PaletteCategory::Action,
+                    action: PaletteAction::SetTitle(title_to_set),
+                });
+                if sessions
+                    .get(active_tab)
+                    .and_then(|s| s.custom_title.as_ref())
+                    .is_some()
+                {
+                    items.push(PaletteItem {
+                        title: "Reset to default auto-derived title".to_string(),
+                        subtitle: Some("Clear custom title and track process name".to_string()),
+                        badge: Some("RESET".to_string()),
+                        icon_color: Some([0xe0, 0xb5, 0x5f]),
+                        category: PaletteCategory::Action,
+                        action: PaletteAction::SetTitle(String::new()),
+                    });
+                }
+            },
         }
 
         self.all_items = items;
@@ -294,23 +423,36 @@ impl PaletteState {
     pub fn filter(&mut self) {
         let q = self.query.trim();
 
+        if self.mode == PaletteMode::EditTitle {
+            self.filtered_items = self.all_items.clone();
+            if let Some(item) = self.filtered_items.first_mut() {
+                let title_to_set = if q.is_empty() { "Untitled" } else { q };
+                item.title = format!("Set Tab Title to: \"{title_to_set}\"");
+                item.action = PaletteAction::SetTitle(q.to_string());
+            }
+            self.selected = 0;
+            return;
+        }
+
         if q.is_empty() {
             self.filtered_items = self.all_items.clone();
         } else {
             let mut matched = Vec::new();
 
-            // If user typed a custom command, let them run it directly
-            matched.push(PaletteItem {
-                title: format!("Run: {q}"),
-                subtitle: Some("Execute directly in active terminal".to_string()),
-                badge: Some("RUN".to_string()),
-                icon_color: Some([0x5e, 0xe6, 0xb8]), // emerald
-                category: PaletteCategory::Action,
-                action: PaletteAction::WriteToPty {
-                    text: q.to_string(),
-                    execute: true,
-                },
-            });
+            if self.mode == PaletteMode::Commands {
+                // If user typed a custom command, let them run it directly
+                matched.push(PaletteItem {
+                    title: format!("Run: {q}"),
+                    subtitle: Some("Execute directly in active terminal".to_string()),
+                    badge: Some("RUN".to_string()),
+                    icon_color: Some([0x5e, 0xe6, 0xb8]), // emerald
+                    category: PaletteCategory::Action,
+                    action: PaletteAction::WriteToPty {
+                        text: q.to_string(),
+                        execute: true,
+                    },
+                });
+            }
 
             for item in &self.all_items {
                 if fuzzy_match(&item.title, q)

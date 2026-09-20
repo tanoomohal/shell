@@ -299,7 +299,11 @@ impl Renderer {
     /// `Layout`. Returns whether the effective width actually changed, so the
     /// caller can skip re-laying out the ptys when dragging past a limit.
     pub fn set_sidebar_width(&mut self, logical: f32) -> bool {
-        let clamped = logical.clamp(ui::SIDEBAR_MIN, ui::SIDEBAR_MAX);
+        let clamped = if logical <= 0.0 {
+            0.0
+        } else {
+            logical.clamp(ui::SIDEBAR_MIN, ui::SIDEBAR_MAX)
+        };
         if (clamped - self.sidebar_logical).abs() < 0.5 {
             return false;
         }
@@ -958,6 +962,8 @@ impl Renderer {
         let mode_label = match palette.mode {
             PaletteMode::Commands => "AGENT & COMMAND PALETTE",
             PaletteMode::History => "VISUAL HISTORY SEARCH",
+            PaletteMode::Inspector => "TERMINAL TAB INSPECTOR",
+            PaletteMode::EditTitle => "EDIT TAB TITLE",
         };
         self.modal_labels.push(Label {
             text: mode_label.to_string(),
@@ -984,6 +990,8 @@ impl Renderer {
         let placeholder = match palette.mode {
             PaletteMode::Commands => "Search agents, actions, prompts, or history…",
             PaletteMode::History => "Search recent shell commands…",
+            PaletteMode::Inspector => "Filter inspector properties…",
+            PaletteMode::EditTitle => "Type new title and press Enter…",
         };
         let (display_text, text_color) = if palette.query.is_empty() {
             (placeholder.to_string(), chrome.text_tertiary)
@@ -1181,6 +1189,10 @@ impl Renderer {
         let under = &mut self.under;
 
         labels.clear();
+
+        if layout.sidebar_width <= 0.0 {
+            return;
+        }
 
         under.push(Quad::new(
             0.0,

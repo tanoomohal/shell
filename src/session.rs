@@ -75,6 +75,8 @@ pub struct Session {
     /// label: a shell can set it to anything, which makes it a much worse
     /// signal than the foreground process.
     pub title: String,
+    /// User-defined custom title set via Edit Title, taking precedence over label.
+    pub custom_title: Option<String>,
     /// Decides the tab's label from foreground-process readings.
     label: LabelTracker,
     /// Last meaningful line of output, shown under the tab's label.
@@ -133,6 +135,7 @@ impl Session {
             master_fd,
             size,
             title: String::new(),
+            custom_title: None,
             label: LabelTracker::new(shell_name()),
             summary: String::new(),
             agent_count: None,
@@ -157,6 +160,11 @@ impl Session {
 
     /// The label shown in the sidebar.
     pub fn label(&self) -> &str {
+        if let Some(ref custom) = self.custom_title {
+            if !custom.is_empty() {
+                return custom.as_str();
+            }
+        }
         self.label.name()
     }
 

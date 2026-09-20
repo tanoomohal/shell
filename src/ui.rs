@@ -88,7 +88,11 @@ impl Layout {
     /// `sidebar_logical` is the user-resizable sidebar width, in logical
     /// pixels, before clamping.
     pub fn new(scale: f32, sidebar_logical: f32) -> Self {
-        let sidebar = sidebar_logical.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+        let sidebar = if sidebar_logical <= 0.0 {
+            0.0
+        } else {
+            sidebar_logical.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+        };
         Self {
             sidebar_width: sidebar * scale,
             divider_grab: DIVIDER_GRAB * scale,
@@ -128,6 +132,9 @@ impl Layout {
 
     /// Maps a physical-pixel cursor position to whatever it's over.
     pub fn hit_test(&self, x: f32, y: f32, tab_count: usize) -> Hit {
+        if self.sidebar_width <= 0.0 {
+            return Hit::Grid;
+        }
         // The divider straddles the boundary, so it is tested before the
         // sidebar/grid split rather than inside either side.
         if (x - self.sidebar_width).abs() <= self.divider_grab {

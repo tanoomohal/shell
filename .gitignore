@@ -2,3 +2,6 @@
 
 # Intermediate output of scripts/make-icons.py; icon.icns is committed.
 /assets/shell.iconset
+
+*.png
+

@@ -6,6 +6,7 @@ mod clipboard;
 mod find;
 mod input;
 mod links;
+mod menu;
 mod palette;
 mod quad;
 mod renderer;
@@ -32,6 +33,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Theme as WindowTheme, Window, WindowId};
 
 use clipboard::Clipboard;
+use menu::AppAction;
 use palette::{PaletteAction, PaletteMode, PaletteState};
 use renderer::Renderer;
 use session::{Session, TermSize, UserEvent};
@@ -56,6 +58,42 @@ const FONT_STEP: f32 = 1.0;
 /// Frame interval while the attention pulse is running. Only ticks this fast
 /// while at least one tab is unattended; idle costs zero frames.
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(33);
+
+fn escape_shell_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        match c {
+            ' ' | '\t' | '\n' | '\r' | '\\' | '"' | '\'' | '`' | '$' | '*' | '?' | '(' | ')'
+            | '[' | ']' | '{' | '}' | '<' | '>' | '&' | ';' | '|' | '~' | '#' | '!' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn export_to_downloads(prefix: &str, content: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let filename = format!("{prefix}-{timestamp}.txt");
+    let path = dir.join(filename);
+    std::fs::write(&path, content)?;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn();
+    }
+    Ok(path)
+}
 
 fn main() {
     env_logger::init();
@@ -88,6 +126,9 @@ struct State {
     dragging_divider: bool,
     /// Set while a text selection is being dragged out in the grid.
     selecting: bool,
+    sidebar_visible: bool,
+    saved_sidebar_logical: f32,
+    option_as_meta: bool,
     last_click: Option<(Instant, PhysicalPosition<f64>)>,
     /// Link under the cursor while the app modifier is held.
     hovered_link: Option<(Line, std::ops::Range<usize>, String)>,
@@ -280,6 +321,7 @@ impl State {
     fn push_session(&mut self, session: Session) {
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
+        menu::update_window_tabs(&self.sessions, self.active);
         self.renderer.window().request_redraw();
     }
 
@@ -293,6 +335,7 @@ impl State {
             let term = self.sessions[index].term.lock();
             find.search(&term);
         }
+        menu::update_window_tabs(&self.sessions, self.active);
         self.renderer.window().request_redraw();
     }
 
@@ -346,8 +389,311 @@ impl State {
         } else if index < self.active {
             self.active -= 1;
         }
+        menu::update_window_tabs(&self.sessions, self.active);
         self.renderer.window().request_redraw();
         true
+    }
+}
+
+impl App {
+    fn execute_action(&mut self, action: AppAction, event_loop: &ActiveEventLoop) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+
+        match action {
+            AppAction::NewTab => {
+                match spawn_session(&mut self.next_id, &self.proxy, &state.renderer) {
+                    Ok(session) => state.push_session(session),
+                    Err(err) => log::error!("failed to spawn pty: {err}"),
+                }
+            }
+            AppAction::CloseTab => {
+                let active = state.active;
+                if !state.close(active) {
+                    event_loop.exit();
+                }
+            }
+            AppAction::CloseWindow => {
+                for session in &state.sessions {
+                    session.shutdown();
+                }
+                event_loop.exit();
+            }
+            AppAction::ExportText => {
+                let text = {
+                    let session = state.active_session();
+                    let term = session.term.lock();
+                    let grid = term.grid();
+                    let mut out = String::new();
+                    let top = grid.topmost_line();
+                    let bottom = Line(grid.screen_lines() as i32);
+                    for line in (top.0..bottom.0).map(Line) {
+                        let row = &grid[line];
+                        let line_str: String =
+                            (0..grid.columns()).map(|c| row[Column(c)].c).collect();
+                        out.push_str(line_str.trim_end());
+                        out.push('\n');
+                    }
+                    out
+                };
+                let _ = export_to_downloads("shell-output", &text);
+            }
+            AppAction::ExportSelection => {
+                let text = state
+                    .active_session()
+                    .term
+                    .lock()
+                    .selection_to_string()
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    let _ = export_to_downloads("shell-selection", &text);
+                }
+            }
+            AppAction::ShowInspector => {
+                if state
+                    .palette
+                    .as_ref()
+                    .map(|p| p.mode == PaletteMode::Inspector)
+                    .unwrap_or(false)
+                {
+                    state.palette = None;
+                } else {
+                    let mut p = PaletteState::new(PaletteMode::Inspector);
+                    p.update_items(&state.sessions, state.active);
+                    state.palette = Some(p);
+                }
+                state.renderer.window().request_redraw();
+            }
+            AppAction::EditTitle => {
+                if state
+                    .palette
+                    .as_ref()
+                    .map(|p| p.mode == PaletteMode::EditTitle)
+                    .unwrap_or(false)
+                {
+                    state.palette = None;
+                } else {
+                    let mut p = PaletteState::new(PaletteMode::EditTitle);
+                    p.query = state
+                        .sessions
+                        .get(state.active)
+                        .and_then(|s| s.custom_title.clone())
+                        .unwrap_or_default();
+                    p.cursor_pos = p.query.len();
+                    p.update_items(&state.sessions, state.active);
+                    state.palette = Some(p);
+                }
+                state.renderer.window().request_redraw();
+            }
+            AppAction::SoftReset => {
+                state.sessions[state.active].write(b"\x1b[!p".to_vec());
+                state.renderer.window().request_redraw();
+            }
+            AppAction::HardReset => {
+                state.sessions[state.active].write(b"\x1bc".to_vec());
+                state.clear_scrollback();
+                state.renderer.window().request_redraw();
+            }
+            AppAction::Undo => {
+                state.sessions[state.active].write(vec![0x1f]);
+                state.renderer.window().request_redraw();
+            }
+            AppAction::Redo => {
+                state.sessions[state.active].write(vec![0x18, 0x15]);
+                state.renderer.window().request_redraw();
+            }
+            AppAction::Cut => {
+                let selected = state.active_session().term.lock().selection_to_string();
+                if let Some(text) = selected.filter(|t| !t.is_empty()) {
+                    state.clipboard.set(&text);
+                    state.sessions[state.active].term.lock().selection = None;
+                } else {
+                    let line_text = {
+                        let session = state.active_session();
+                        let term = session.term.lock();
+                        let cursor = term.grid().cursor.point;
+                        session.row_text(cursor.line)
+                    };
+                    let trimmed = line_text.trim_end();
+                    if !trimmed.is_empty() {
+                        state.clipboard.set(trimmed);
+                    }
+                    state.sessions[state.active].write(vec![0x15]);
+                }
+                state.renderer.window().request_redraw();
+            }
+            AppAction::Copy => {
+                let selected = state.active_session().term.lock().selection_to_string();
+                if let Some(text) = selected.filter(|t| !t.is_empty()) {
+                    state.clipboard.set(&text);
+                } else {
+                    state.sessions[state.active].write(vec![0x03]);
+                }
+                state.renderer.window().request_redraw();
+            }
+            AppAction::Paste => {
+                state.paste();
+            }
+            AppAction::PasteEscaped => {
+                if let Some(text) = state.clipboard.get() {
+                    let escaped = escape_shell_string(&text);
+                    paste_into(&state.sessions[state.active], &escaped);
+                    state.renderer.window().request_redraw();
+                }
+            }
+            AppAction::PasteSelection => {
+                state.paste_primary();
+            }
+            AppAction::SelectAll => {
+                state.select_all();
+            }
+            AppAction::ClearToStart => {
+                state.sessions[state.active].write(vec![0x15]);
+                state.clear_scrollback();
+                state.renderer.window().request_redraw();
+            }
+            AppAction::ClearScrollback => {
+                state.clear_scrollback();
+            }
+            AppAction::ClearScreen => {
+                state.sessions[state.active].write(vec![0x0c]);
+                state.renderer.window().request_redraw();
+            }
+            AppAction::Find => {
+                let initial = {
+                    let term = state.sessions[state.active].term.lock();
+                    term.selection_to_string().unwrap_or_default()
+                };
+                if initial.is_empty() {
+                    state.find.get_or_insert_with(find::FindState::new);
+                } else {
+                    state.find = Some(find::FindState::with_query(&initial));
+                }
+                if let Some(ref mut find) = state.find {
+                    let term = state.sessions[state.active].term.lock();
+                    find.search(&term);
+                }
+                state.renderer.window().request_redraw();
+            }
+            AppAction::FindNext => {
+                if let Some(ref mut find) = state.find {
+                    find.next_match();
+                    state.scroll_to_find_match();
+                    state.renderer.window().request_redraw();
+                }
+            }
+            AppAction::FindPrev => {
+                if let Some(ref mut find) = state.find {
+                    find.prev_match();
+                    state.scroll_to_find_match();
+                    state.renderer.window().request_redraw();
+                }
+            }
+            AppAction::ToggleOptionAsMeta => {
+                state.option_as_meta = !state.option_as_meta;
+                log::info!("Use Option as Meta Key: {}", state.option_as_meta);
+            }
+            AppAction::ToggleSidebar => {
+                state.sidebar_visible = !state.sidebar_visible;
+                let width = if state.sidebar_visible {
+                    state.saved_sidebar_logical.max(ui::SIDEBAR_MIN)
+                } else {
+                    0.0
+                };
+                state.renderer.set_sidebar_width(width);
+                state.resize_sessions();
+                state.renderer.window().request_redraw();
+            }
+            AppAction::ResetFontSize => {
+                state.adjust_font_size(0.0);
+            }
+            AppAction::ZoomIn => {
+                state.adjust_font_size(FONT_STEP);
+            }
+            AppAction::ZoomOut => {
+                state.adjust_font_size(-FONT_STEP);
+            }
+            AppAction::ScrollTop => {
+                state.active_session().term.lock().scroll_display(Scroll::Top);
+                state.renderer.window().request_redraw();
+            }
+            AppAction::ScrollBottom => {
+                state.active_session().term.lock().scroll_display(Scroll::Bottom);
+                state.renderer.window().request_redraw();
+            }
+            AppAction::PageUp => {
+                state.active_session().term.lock().scroll_display(Scroll::PageUp);
+                state.renderer.window().request_redraw();
+            }
+            AppAction::PageDown => {
+                state.active_session().term.lock().scroll_display(Scroll::PageDown);
+                state.renderer.window().request_redraw();
+            }
+            AppAction::LineUp => {
+                state.active_session().term.lock().scroll_display(Scroll::Delta(1));
+                state.renderer.window().request_redraw();
+            }
+            AppAction::LineDown => {
+                state.active_session().term.lock().scroll_display(Scroll::Delta(-1));
+                state.renderer.window().request_redraw();
+            }
+            AppAction::ToggleFullScreen => {
+                let win = state.renderer.window();
+                let is_fullscreen = win.fullscreen().is_some();
+                win.set_fullscreen(if is_fullscreen {
+                    None
+                } else {
+                    Some(winit::window::Fullscreen::Borderless(None))
+                });
+            }
+            AppAction::Minimize => {
+                state.renderer.window().set_minimized(true);
+            }
+            AppAction::Zoom => {
+                let win = state.renderer.window();
+                win.set_maximized(!win.is_maximized());
+            }
+            AppAction::NextTab => {
+                state.cycle(true);
+            }
+            AppAction::PrevTab => {
+                state.cycle(false);
+            }
+            AppAction::SelectTab(n) => {
+                state.activate(n);
+            }
+            AppAction::CommandPalette => {
+                if state
+                    .palette
+                    .as_ref()
+                    .map(|p| p.mode == PaletteMode::Commands)
+                    .unwrap_or(false)
+                {
+                    state.palette = None;
+                } else {
+                    let mut p = PaletteState::new(PaletteMode::Commands);
+                    p.update_items(&state.sessions, state.active);
+                    state.palette = Some(p);
+                }
+                state.renderer.window().request_redraw();
+            }
+            AppAction::HistorySearch => {
+                if state
+                    .palette
+                    .as_ref()
+                    .map(|p| p.mode == PaletteMode::History)
+                    .unwrap_or(false)
+                {
+                    state.palette = None;
+                } else {
+                    let mut p = PaletteState::new(PaletteMode::History);
+                    p.update_items(&state.sessions, state.active);
+                    state.palette = Some(p);
+                }
+                state.renderer.window().request_redraw();
+            }
+        }
     }
 }
 
@@ -401,6 +747,9 @@ impl ApplicationHandler<UserEvent> for App {
             scroll_remainder: 0.0,
             dragging_divider: false,
             selecting: false,
+            sidebar_visible: true,
+            saved_sidebar_logical: 220.0,
+            option_as_meta: true,
             last_click: None,
             hovered_link: None,
             click_count: 0,
@@ -410,6 +759,12 @@ impl ApplicationHandler<UserEvent> for App {
             started: Instant::now(),
             renderer,
         });
+
+        menu::init_proxy(self.proxy.clone());
+        menu::setup_menu_bar();
+        if let Some(state) = &self.state {
+            menu::update_window_tabs(&state.sessions, state.active);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -467,6 +822,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.dragging_divider {
                     let logical = position.x as f32 / state.renderer.scale;
                     if state.renderer.set_sidebar_width(logical) {
+                        state.saved_sidebar_logical = logical.clamp(ui::SIDEBAR_MIN, ui::SIDEBAR_MAX);
+                        state.sidebar_visible = true;
                         // The grid narrowed or widened, so the ptys have to be
                         // told about their new size.
                         state.resize_sessions();
@@ -590,6 +947,51 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // View & Line Navigation shortcuts
+                if state.mods.super_key() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Home) => {
+                            self.execute_action(AppAction::ScrollTop, event_loop);
+                            return;
+                        }
+                        Key::Named(NamedKey::End) => {
+                            self.execute_action(AppAction::ScrollBottom, event_loop);
+                            return;
+                        }
+                        Key::Named(NamedKey::PageUp) => {
+                            self.execute_action(AppAction::PageUp, event_loop);
+                            return;
+                        }
+                        Key::Named(NamedKey::PageDown) => {
+                            self.execute_action(AppAction::PageDown, event_loop);
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowUp) if state.mods.alt_key() => {
+                            self.execute_action(AppAction::LineUp, event_loop);
+                            return;
+                        }
+                        Key::Named(NamedKey::ArrowDown) if state.mods.alt_key() => {
+                            self.execute_action(AppAction::LineDown, event_loop);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if state.mods.shift_key() && !state.mods.super_key() && !state.mods.control_key() {
+                    match &event.logical_key {
+                        Key::Named(NamedKey::PageUp) => {
+                            self.execute_action(AppAction::PageUp, event_loop);
+                            return;
+                        }
+                        Key::Named(NamedKey::PageDown) => {
+                            self.execute_action(AppAction::PageDown, event_loop);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Application shortcuts are handled before the pty sees the key.
                 let is_cmd = state.mods.super_key();
                 let is_ctrl_shift = state.mods.control_key() && state.mods.shift_key();
@@ -608,38 +1010,22 @@ impl ApplicationHandler<UserEvent> for App {
                         false
                     };
 
-                    if matches_key(KeyCode::KeyC, 'c') {
-                        let selected = state.active_session().term.lock().selection_to_string();
-                        if let Some(text) = selected.filter(|t| !t.is_empty()) {
-                            state.clipboard.set(&text);
+                    if matches_key(KeyCode::KeyZ, 'z') {
+                        if state.mods.shift_key() {
+                            self.execute_action(AppAction::Redo, event_loop);
                         } else {
-                            // No selection: send SIGINT (\x03) so Cmd+C cancels running process / prompt
-                            state.sessions[state.active].write(vec![0x03]);
+                            self.execute_action(AppAction::Undo, event_loop);
                         }
-                        state.renderer.window().request_redraw();
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyC, 'c') {
+                        self.execute_action(AppAction::Copy, event_loop);
                         return;
                     }
 
                     if matches_key(KeyCode::KeyX, 'x') {
-                        let selected = state.active_session().term.lock().selection_to_string();
-                        if let Some(text) = selected.filter(|t| !t.is_empty()) {
-                            state.clipboard.set(&text);
-                            state.sessions[state.active].term.lock().selection = None;
-                        } else {
-                            // Cut current line at prompt: copy row text and send Ctrl+U (\x15)
-                            let line_text = {
-                                let session = state.active_session();
-                                let term = session.term.lock();
-                                let cursor = term.grid().cursor.point;
-                                session.row_text(cursor.line)
-                            };
-                            let trimmed = line_text.trim_end();
-                            if !trimmed.is_empty() {
-                                state.clipboard.set(trimmed);
-                            }
-                            state.sessions[state.active].write(vec![0x15]);
-                        }
-                        state.renderer.window().request_redraw();
+                        self.execute_action(AppAction::Cut, event_loop);
                         return;
                     }
 
@@ -663,148 +1049,157 @@ impl ApplicationHandler<UserEvent> for App {
                                 palette.update_items(&state.sessions, state.active);
                             }
                             state.renderer.window().request_redraw();
+                        } else if state.mods.control_key() {
+                            self.execute_action(AppAction::PasteEscaped, event_loop);
+                        } else if state.mods.shift_key() {
+                            self.execute_action(AppAction::PasteSelection, event_loop);
                         } else {
-                            state.paste();
+                            self.execute_action(AppAction::Paste, event_loop);
                         }
                         return;
                     }
 
                     if matches_key(KeyCode::KeyA, 'a') {
-                        state.select_all();
+                        self.execute_action(AppAction::SelectAll, event_loop);
                         return;
                     }
 
                     if matches_key(KeyCode::KeyT, 't') {
-                        match spawn_session(
-                            &mut self.next_id,
-                            &self.proxy,
-                            &state.renderer,
-                        ) {
-                            Ok(session) => state.push_session(session),
-                            Err(err) => log::error!("failed to spawn pty: {err}"),
+                        if state.mods.shift_key() {
+                            self.execute_action(AppAction::ToggleSidebar, event_loop);
+                        } else {
+                            self.execute_action(AppAction::NewTab, event_loop);
                         }
                         return;
                     }
 
                     if matches_key(KeyCode::KeyW, 'w') {
-                        let active = state.active;
-                        if !state.close(active) {
-                            event_loop.exit();
+                        if state.mods.shift_key() {
+                            self.execute_action(AppAction::CloseWindow, event_loop);
+                        } else {
+                            self.execute_action(AppAction::CloseTab, event_loop);
+                        }
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyS, 's') {
+                        if state.mods.shift_key() {
+                            self.execute_action(AppAction::ExportSelection, event_loop);
+                        } else {
+                            self.execute_action(AppAction::ExportText, event_loop);
+                        }
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyI, 'i') {
+                        if state.mods.shift_key() {
+                            self.execute_action(AppAction::EditTitle, event_loop);
+                        } else {
+                            self.execute_action(AppAction::ShowInspector, event_loop);
                         }
                         return;
                     }
 
                     if matches_key(KeyCode::KeyK, 'k') {
-                        state.clear_scrollback();
+                        if state.mods.alt_key() {
+                            self.execute_action(AppAction::ClearScrollback, event_loop);
+                        } else {
+                            self.execute_action(AppAction::ClearToStart, event_loop);
+                        }
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyL, 'l') && state.mods.control_key() {
+                        self.execute_action(AppAction::ClearScreen, event_loop);
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyO, 'o') && state.mods.alt_key() {
+                        self.execute_action(AppAction::ToggleOptionAsMeta, event_loop);
                         return;
                     }
 
                     if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd))
                         || matches!(&event.logical_key, Key::Character(c) if c.as_str() == "+" || c.as_str() == "=")
                     {
-                        state.adjust_font_size(FONT_STEP);
+                        self.execute_action(AppAction::ZoomIn, event_loop);
                         return;
                     }
 
                     if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract))
                         || matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-")
                     {
-                        state.adjust_font_size(-FONT_STEP);
+                        self.execute_action(AppAction::ZoomOut, event_loop);
                         return;
                     }
 
                     if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Digit0 | KeyCode::Numpad0))
                         || matches!(&event.logical_key, Key::Character(c) if c.as_str() == "0")
                     {
-                        state.adjust_font_size(0.0);
+                        self.execute_action(AppAction::ResetFontSize, event_loop);
                         return;
                     }
 
                     if matches_key(KeyCode::BracketRight, ']') {
-                        state.cycle(true);
+                        self.execute_action(AppAction::NextTab, event_loop);
                         return;
                     }
 
                     if matches_key(KeyCode::BracketLeft, '[') {
-                        state.cycle(false);
+                        self.execute_action(AppAction::PrevTab, event_loop);
                         return;
                     }
 
                     if matches_key(KeyCode::KeyF, 'f') {
-                        let initial = {
-                            let term = state.sessions[state.active].term.lock();
-                            term.selection_to_string().unwrap_or_default()
-                        };
-                        if initial.is_empty() {
-                            state.find.get_or_insert_with(find::FindState::new);
+                        if state.mods.control_key() {
+                            self.execute_action(AppAction::ToggleFullScreen, event_loop);
                         } else {
-                            state.find = Some(find::FindState::with_query(&initial));
+                            self.execute_action(AppAction::Find, event_loop);
                         }
-                        if let Some(ref mut find) = state.find {
-                            let term = state.sessions[state.active].term.lock();
-                            find.search(&term);
-                        }
-                        state.renderer.window().request_redraw();
                         return;
                     }
 
                     if matches_key(KeyCode::KeyG, 'g') {
-                        if let Some(ref mut find) = state.find {
-                            if state.mods.shift_key() {
-                                find.prev_match();
-                            } else {
-                                find.next_match();
-                            }
-                            state.scroll_to_find_match();
-                            state.renderer.window().request_redraw();
+                        if state.mods.shift_key() {
+                            self.execute_action(AppAction::FindPrev, event_loop);
+                        } else {
+                            self.execute_action(AppAction::FindNext, event_loop);
                         }
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyM, 'm') {
+                        self.execute_action(AppAction::Minimize, event_loop);
                         return;
                     }
 
                     if matches_key(KeyCode::KeyQ, 'q') {
-                        for session in &state.sessions {
-                            session.shutdown();
-                        }
-                        event_loop.exit();
+                        self.execute_action(AppAction::CloseWindow, event_loop);
                         return;
                     }
 
                     if matches_key(KeyCode::KeyP, 'p') {
-                        if state
-                            .palette
-                            .as_ref()
-                            .map(|p| p.mode == PaletteMode::Commands)
-                            .unwrap_or(false)
-                        {
-                            state.palette = None;
-                        } else {
-                            let mut p = PaletteState::new(PaletteMode::Commands);
-                            p.update_items(&state.sessions, state.active);
-                            state.palette = Some(p);
-                        }
-                        state.renderer.window().request_redraw();
+                        self.execute_action(AppAction::CommandPalette, event_loop);
                         return;
                     }
 
                     if matches_key(KeyCode::KeyR, 'r') {
-                        if state
-                            .palette
-                            .as_ref()
-                            .map(|p| p.mode == PaletteMode::History)
-                            .unwrap_or(false)
-                        {
-                            state.palette = None;
+                        if state.mods.alt_key() && state.mods.control_key() {
+                            self.execute_action(AppAction::HardReset, event_loop);
+                        } else if state.mods.alt_key() {
+                            self.execute_action(AppAction::SoftReset, event_loop);
                         } else {
-                            let mut p = PaletteState::new(PaletteMode::History);
-                            p.update_items(&state.sessions, state.active);
-                            state.palette = Some(p);
+                            self.execute_action(AppAction::HistorySearch, event_loop);
                         }
-                        state.renderer.window().request_redraw();
                         return;
                     }
 
                     if matches!(&event.logical_key, Key::Named(NamedKey::Tab)) {
-                        state.cycle(!state.mods.shift_key());
+                        if state.mods.shift_key() {
+                            self.execute_action(AppAction::PrevTab, event_loop);
+                        } else {
+                            self.execute_action(AppAction::NextTab, event_loop);
+                        }
                         return;
                     }
 
@@ -828,7 +1223,7 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     if let Some(n) = digit_opt {
                         if n >= 1 {
-                            state.activate(n - 1);
+                            self.execute_action(AppAction::SelectTab(n - 1), event_loop);
                         }
                         return;
                     }
@@ -951,6 +1346,17 @@ impl ApplicationHandler<UserEvent> for App {
                             PaletteAction::Zoom(delta) => {
                                 state.adjust_font_size(delta * FONT_STEP);
                             },
+                            PaletteAction::SetTitle(new_title) => {
+                                if let Some(session) = state.sessions.get_mut(state.active) {
+                                    if new_title.is_empty() {
+                                        session.custom_title = None;
+                                    } else {
+                                        session.custom_title = Some(new_title);
+                                    }
+                                }
+                                menu::update_window_tabs(&state.sessions, state.active);
+                            },
+                            PaletteAction::None => {},
                         }
                     }
 
@@ -1034,10 +1440,18 @@ impl ApplicationHandler<UserEvent> for App {
                     .mode()
                     .contains(TermMode::APP_CURSOR);
 
+                let effective_mods = if !state.option_as_meta && state.mods.alt_key() {
+                    let mut m = state.mods;
+                    m.remove(ModifiersState::ALT);
+                    m
+                } else {
+                    state.mods
+                };
+
                 if let Some(bytes) = input::encode(
                     &event.logical_key,
                     event.text.as_deref(),
-                    state.mods,
+                    effective_mods,
                     app_cursor,
                 ) {
                     let session = &state.sessions[state.active];
@@ -1092,6 +1506,14 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        if event.session == u64::MAX {
+            let actions = menu::take_pending_actions();
+            for action in actions {
+                self.execute_action(action, event_loop);
+            }
+            return;
+        }
+
         let Some(state) = &mut self.state else {
             return;
         };
@@ -1108,12 +1530,19 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             },
 
-            TermEvent::Title(title) => state.sessions[index].title = title,
-            TermEvent::ResetTitle => state.sessions[index].title.clear(),
+            TermEvent::Title(title) => {
+                state.sessions[index].title = title;
+                menu::update_window_tabs(&state.sessions, state.active);
+            },
+            TermEvent::ResetTitle => {
+                state.sessions[index].title.clear();
+                menu::update_window_tabs(&state.sessions, state.active);
+            },
 
             TermEvent::Bell => {
                 if index != state.active {
                     state.sessions[index].flag_attention();
+                    menu::update_window_tabs(&state.sessions, state.active);
                     state.renderer.window().request_redraw();
                 }
             },
@@ -1153,6 +1582,7 @@ impl ApplicationHandler<UserEvent> for App {
             changed |= session.poll_state(index == active);
         }
         if changed {
+            menu::update_window_tabs(&state.sessions, state.active);
             state.renderer.window().request_redraw();
         }
 
@@ -1189,5 +1619,26 @@ fn paste_into(session: &Session, text: &str) {
         session.write(b"\x1b[201~".to_vec());
     } else {
         session.write(body.into_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_shell_string() {
+        assert_eq!(
+            escape_shell_string("hello world"),
+            "hello\\ world"
+        );
+        assert_eq!(
+            escape_shell_string("path/to/My Documents/file (1).txt"),
+            "path/to/My\\ Documents/file\\ \\(1\\).txt"
+        );
+        assert_eq!(
+            escape_shell_string("echo \"$VAR\" & foo; bar"),
+            "echo\\ \\\"\\$VAR\\\"\\ \\&\\ foo\\;\\ bar"
+        );
     }
 }
