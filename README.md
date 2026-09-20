@@ -122,6 +122,10 @@ Hold the app modifier to light up URLs and click to open them. On Linux,
 selecting copies to the primary selection and middle-click pastes it. Drag the
 sidebar's right edge to resize it.
 
+## Features & Capabilities
+
+For the complete, comprehensive guide to all capabilities, architectures, and keybindings, see **[FEATURES.md](FEATURES.md)**.
+
 ## Status
 
 Working: truecolor and 256-color, bold/italic/inverse/dim, box drawing, all
@@ -131,8 +135,11 @@ paste with bracketed-paste hardening, OSC 52, primary selection and
 middle-click paste on Linux, mouse selection by character, word and line,
 clickable URLs, font zoom, resizable sidebar, per-tab output summaries, agent
 detection with attention state and sub-agent counts, theme system that
-follows system appearance, find-in-buffer search overlay, and an Arc/Dia-style
-floating command and history palette centered around agent CLIs.
+follows system appearance, find-in-buffer search overlay, an Arc/Dia-style
+floating command and history palette centered around agent CLIs, native macOS
+menu bar (Shell, Edit, View, Window, Help) with dynamic tab switching, text and
+selection export to Downloads, tab inspector, custom tab renaming, and soft/hard
+terminal resets.
 
 Shell-side line editing — history, `Ctrl+R`, `Ctrl+A`/`E`/`W`/`U`/`K`, Tab
 completion, and `Ctrl+_`/`Ctrl+/` undo — is the shell's own and passes through untouched. There are tests
