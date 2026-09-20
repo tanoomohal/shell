@@ -63,6 +63,8 @@ pub struct QuadPipeline {
     capacity: usize,
     under_count: u32,
     over_count: u32,
+    modal_under_count: u32,
+    modal_over_count: u32,
 }
 
 impl QuadPipeline {
@@ -149,6 +151,8 @@ impl QuadPipeline {
             capacity: 1024,
             under_count: 0,
             over_count: 0,
+            modal_under_count: 0,
+            modal_over_count: 0,
         }
     }
 
@@ -167,6 +171,8 @@ impl QuadPipeline {
         queue: &Queue,
         under: &[Quad],
         over: &[Quad],
+        modal_under: &[Quad],
+        modal_over: &[Quad],
         screen: [f32; 2],
     ) {
         queue.write_buffer(
@@ -178,22 +184,38 @@ impl QuadPipeline {
             }),
         );
 
-        let needed = under.len() + over.len();
+        let needed = under.len() + over.len() + modal_under.len() + modal_over.len();
         if needed > self.capacity {
-            self.capacity = needed.next_power_of_two();
+            self.capacity = needed.next_power_of_two().max(1024);
             self.instances = Self::alloc(device, self.capacity);
         }
 
+        let mut offset_bytes = 0u64;
+        let quad_size = std::mem::size_of::<Quad>() as u64;
+
         if !under.is_empty() {
-            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(under));
+            queue.write_buffer(&self.instances, offset_bytes, bytemuck::cast_slice(under));
         }
+        offset_bytes += under.len() as u64 * quad_size;
+
         if !over.is_empty() {
-            let offset = (under.len() * std::mem::size_of::<Quad>()) as u64;
-            queue.write_buffer(&self.instances, offset, bytemuck::cast_slice(over));
+            queue.write_buffer(&self.instances, offset_bytes, bytemuck::cast_slice(over));
+        }
+        offset_bytes += over.len() as u64 * quad_size;
+
+        if !modal_under.is_empty() {
+            queue.write_buffer(&self.instances, offset_bytes, bytemuck::cast_slice(modal_under));
+        }
+        offset_bytes += modal_under.len() as u64 * quad_size;
+
+        if !modal_over.is_empty() {
+            queue.write_buffer(&self.instances, offset_bytes, bytemuck::cast_slice(modal_over));
         }
 
         self.under_count = under.len() as u32;
         self.over_count = over.len() as u32;
+        self.modal_under_count = modal_under.len() as u32;
+        self.modal_over_count = modal_over.len() as u32;
     }
 
     pub fn render_under(&self, pass: &mut RenderPass<'_>) {
@@ -202,6 +224,18 @@ impl QuadPipeline {
 
     pub fn render_over(&self, pass: &mut RenderPass<'_>) {
         self.draw(pass, self.under_count, self.over_count);
+    }
+
+    pub fn render_modal_under(&self, pass: &mut RenderPass<'_>) {
+        self.draw(pass, self.under_count + self.over_count, self.modal_under_count);
+    }
+
+    pub fn render_modal_over(&self, pass: &mut RenderPass<'_>) {
+        self.draw(
+            pass,
+            self.under_count + self.over_count + self.modal_under_count,
+            self.modal_over_count,
+        );
     }
 
     fn draw(&self, pass: &mut RenderPass<'_>, start: u32, count: u32) {

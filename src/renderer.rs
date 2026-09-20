@@ -23,9 +23,11 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
 use crate::agent::Activity;
+use crate::find::FindState;
+use crate::palette::{PaletteCategory, PaletteMode, PaletteState};
 use crate::quad::{Quad, QuadPipeline};
 use crate::session::{Session, TermSize};
-use crate::theme::{linear_rgba, Rgb8, Theme};
+use crate::theme::{linear_rgba, mix, Rgb8, Theme};
 use crate::themes;
 use crate::ui::{self, Layout};
 
@@ -84,10 +86,14 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
+    modal_text_renderer: TextRenderer,
 
     grid_buf: TextBuffer,
     chrome_bufs: Vec<TextBuffer>,
     labels: Vec<Label>,
+
+    modal_bufs: Vec<TextBuffer>,
+    modal_labels: Vec<Label>,
 
     /// Grid line and column range of the link under the cursor, if any.
     link: Option<(Line, std::ops::Range<usize>)>,
@@ -95,6 +101,8 @@ pub struct Renderer {
     quads: QuadPipeline,
     under: Vec<Quad>,
     over: Vec<Quad>,
+    modal_under: Vec<Quad>,
+    modal_over: Vec<Quad>,
     text: String,
     spans: Vec<Span>,
 
@@ -156,6 +164,8 @@ impl Renderer {
         let mut atlas = TextAtlas::new(&device, &queue, &cache, SURFACE_FORMAT);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let modal_text_renderer =
+            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         let metrics = measure_cell(&mut font_system, &font_family, font_size * scale);
         let grid_buf = new_grid_buffer(&mut font_system, metrics);
@@ -172,13 +182,18 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
+            modal_text_renderer,
             grid_buf,
             chrome_bufs: Vec::new(),
             labels: Vec::new(),
+            modal_bufs: Vec::new(),
+            modal_labels: Vec::new(),
             link: None,
             quads,
             under: Vec::new(),
             over: Vec::new(),
+            modal_under: Vec::new(),
+            modal_over: Vec::new(),
             text: String::new(),
             spans: Vec::new(),
             font_family,
@@ -223,6 +238,7 @@ impl Renderer {
         self.grid_buf = new_grid_buffer(&mut self.font_system, self.metrics);
         // Chrome buffers are rebuilt with the new metrics on the next frame.
         self.chrome_bufs.clear();
+        self.modal_bufs.clear();
     }
 
     /// Maps a physical cursor position to a grid point plus which half of the
@@ -334,10 +350,21 @@ impl Renderer {
 
     /// `breathe` is a 0..1 triangle-free sine ramp driving the attention
     /// pulse; callers pass a constant when nothing is waiting.
-    pub fn render(&mut self, sessions: &[Session], active: usize, breathe: f32) {
+    pub fn render(
+        &mut self,
+        sessions: &[Session],
+        active: usize,
+        breathe: f32,
+        find: Option<&FindState>,
+        palette: Option<&PaletteState>,
+    ) {
         let Some(session) = sessions.get(active) else {
             return;
         };
+
+        self.modal_under.clear();
+        self.modal_over.clear();
+        self.modal_labels.clear();
 
         let grid = self.grid_size();
         let (grid_x, grid_y) = self.grid_origin(grid);
@@ -349,7 +376,21 @@ impl Renderer {
 
         self.build_grid(session, grid_x, grid_y, screen_w, screen_h);
         self.build_chrome(sessions, active, screen_h, breathe);
+
+        // Find-in-buffer: highlight matches and render the search bar.
+        if let Some(find) = find {
+            let display_offset = session.term.lock().grid().display_offset();
+            self.build_find_highlights(find, grid_x, grid_y, display_offset, grid);
+            self.build_find_bar(find, grid_x, grid_y, screen_w);
+        }
+
+        // Agent & Command Palette / Visual History overlay
+        if let Some(palette) = palette {
+            self.build_palette(palette, screen_w, screen_h);
+        }
+
         self.sync_chrome_buffers();
+        self.sync_modal_buffers();
 
         let Self {
             device,
@@ -357,9 +398,12 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
+            modal_text_renderer,
             grid_buf,
             chrome_bufs,
             labels,
+            modal_bufs,
+            modal_labels,
             font_system,
             swash_cache,
             theme,
@@ -416,11 +460,38 @@ impl Renderer {
             return;
         }
 
+        let mut modal_areas: Vec<TextArea> = Vec::with_capacity(modal_labels.len());
+        for (label, buffer) in modal_labels.iter().zip(modal_bufs.iter()) {
+            modal_areas.push(TextArea {
+                buffer,
+                left: label.x,
+                top: label.y,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: label.x as i32,
+                    top: label.y as i32,
+                    right: (label.x + label.max_width) as i32,
+                    bottom: (label.y + label.line_height * 1.5 * self.scale) as i32,
+                },
+                default_color: TextColor::rgb(label.color[0], label.color[1], label.color[2]),
+                custom_glyphs: &[],
+            });
+        }
+        if !modal_areas.is_empty() {
+            if let Err(err) = modal_text_renderer.prepare(
+                device, queue, font_system, atlas, viewport, modal_areas, swash_cache,
+            ) {
+                log::warn!("modal text prepare failed: {err:?}");
+            }
+        }
+
         self.quads.prepare(
             &self.device,
             &self.queue,
             &self.under,
             &self.over,
+            &self.modal_under,
+            &self.modal_over,
             [screen_w, screen_h],
         );
 
@@ -486,6 +557,19 @@ impl Renderer {
                 log::warn!("text render failed: {err:?}");
             }
             self.quads.render_over(&mut pass);
+
+            if !self.modal_under.is_empty() || !self.modal_labels.is_empty() {
+                self.quads.render_modal_under(&mut pass);
+                if !self.modal_labels.is_empty() {
+                    if let Err(err) = self
+                        .modal_text_renderer
+                        .render(&self.atlas, &self.viewport, &mut pass)
+                    {
+                        log::warn!("modal text render failed: {err:?}");
+                    }
+                }
+                self.quads.render_modal_over(&mut pass);
+            }
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -692,6 +776,394 @@ impl Renderer {
         );
         grid_buf.set_rich_text(styled, &default_attrs, Shaping::Advanced, None);
         grid_buf.shape_until_scroll(font_system, false);
+    }
+
+    /// Highlights find-in-buffer matches on the visible grid.
+    ///
+    /// All matches get a subdued background; the current match gets a brighter
+    /// one so the user can see where they are in the result list.
+    fn build_find_highlights(
+        &mut self,
+        find: &FindState,
+        grid_x: f32,
+        grid_y: f32,
+        display_offset: usize,
+        grid: TermSize,
+    ) {
+        if find.query.is_empty() || find.matches.is_empty() {
+            return;
+        }
+
+        let current_idx = find.current;
+        let highlight_all = mix(self.theme.palette.ansi[3], self.theme.bg(), 0.70);
+        let highlight_current = self.theme.palette.ansi[3]; // yellow
+
+        for (i, m) in find.matches.iter().enumerate() {
+            let Some(vp) = point_to_viewport(
+                display_offset,
+                Point::new(m.line, Column(m.start_col)),
+            ) else {
+                continue;
+            };
+            // Skip matches outside the visible viewport.
+            if vp.line >= grid.screen_lines {
+                continue;
+            }
+            let x = grid_x + vp.column.0 as f32 * self.metrics.width;
+            let y = grid_y + vp.line as f32 * self.metrics.height;
+            let w = (m.end_col - m.start_col) as f32 * self.metrics.width;
+            let color = if i == current_idx {
+                highlight_current
+            } else {
+                highlight_all
+            };
+            let alpha = if i == current_idx { 0.45 } else { 0.22 };
+            self.over.push(Quad::new(x, y, w, self.metrics.height, linear_rgba(color, alpha)));
+        }
+    }
+
+    /// Renders the find bar: a floating input area at the top-right of the
+    /// terminal grid, showing the search query and match status.
+    fn build_find_bar(
+        &mut self,
+        find: &FindState,
+        _grid_x: f32,
+        grid_y: f32,
+        screen_w: f32,
+    ) {
+        let scale = self.scale;
+        let chrome = self.theme.chrome;
+
+        // Dimensions in logical pixels.
+        let bar_h = 28.0 * scale;
+        let bar_w = 260.0 * scale;
+        let margin = 8.0 * scale;
+        let bar_x = screen_w - bar_w - margin;
+        let bar_y = grid_y;
+        let inner_pad = 8.0 * scale;
+
+        // Background and border rendered in the modal overlay layer.
+        self.modal_under.push(Quad::rounded(
+            bar_x,
+            bar_y,
+            bar_w,
+            bar_h,
+            4.0 * scale,
+            linear_rgba(chrome.surface, 0.96),
+        ));
+        self.modal_under.push(Quad::rounded(
+            bar_x,
+            bar_y,
+            bar_w,
+            bar_h,
+            4.0 * scale,
+            linear_rgba(chrome.border, 0.40),
+        ));
+
+        // Cursor indicator: a thin beam in the query text.
+        let char_w = CHROME_FONT_SIZE * scale * 0.6;
+        let chars_before = find.query[..find.cursor_pos].chars().count() as f32;
+        let cursor_x = bar_x + inner_pad + chars_before * char_w;
+        let cursor_y = bar_y + 5.0 * scale;
+        let cursor_h = bar_h - 10.0 * scale;
+        self.modal_over.push(Quad::new(
+            cursor_x,
+            cursor_y,
+            (1.5 * scale).max(1.0),
+            cursor_h,
+            linear_rgba(chrome.text_primary, 0.8),
+        ));
+
+        // Query label.
+        let status = find.status();
+        let display = if find.query.is_empty() {
+            "Find…".to_string()
+        } else {
+            find.query.clone()
+        };
+        let query_color = if find.query.is_empty() {
+            chrome.text_tertiary
+        } else {
+            chrome.text_primary
+        };
+
+        self.modal_labels.push(Label {
+            text: display,
+            x: bar_x + inner_pad,
+            y: bar_y + (bar_h - CHROME_LINE_HEIGHT * scale) / 2.0,
+            max_width: bar_w - inner_pad * 2.0 - 60.0 * scale,
+            color: query_color,
+            font_size: CHROME_FONT_SIZE,
+            line_height: CHROME_LINE_HEIGHT,
+        });
+
+        // Status label ("3 of 42" / "No matches").
+        if !status.is_empty() {
+            self.modal_labels.push(Label {
+                text: status,
+                x: bar_x + bar_w - inner_pad - 55.0 * scale,
+                y: bar_y + (bar_h - CHROME_LINE_HEIGHT * scale) / 2.0,
+                max_width: 55.0 * scale,
+                color: chrome.text_tertiary,
+                font_size: ui::SUMMARY_SIZE,
+                line_height: CHROME_LINE_HEIGHT,
+            });
+        }
+    }
+
+    /// Renders the Arc/Dia-style visual fuzzy command and history palette overlay.
+    fn build_palette(&mut self, palette: &PaletteState, screen_w: f32, screen_h: f32) {
+        let scale = self.scale;
+        let chrome = self.theme.chrome;
+
+        // 1. Semi-transparent dark backdrop dims the terminal behind the modal
+        self.modal_under.push(Quad::new(
+            0.0,
+            0.0,
+            screen_w,
+            screen_h,
+            [0.0, 0.0, 0.0, 0.50],
+        ));
+
+        // 2. Centered Floating Card
+        let card_w = (560.0 * scale).min(screen_w - 32.0 * scale);
+        let card_h = (380.0 * scale).min(screen_h - 48.0 * scale);
+        let card_x = (screen_w - card_w) / 2.0;
+        let card_y = ((screen_h - card_h) / 2.0 - 24.0 * scale).max(16.0 * scale);
+        let corner_radius = 10.0 * scale;
+
+        // Card surface and crisp antialiased border
+        self.modal_under.push(Quad::rounded(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            corner_radius,
+            linear_rgba(chrome.surface, 0.98),
+        ));
+        self.modal_under.push(Quad::rounded(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            corner_radius,
+            linear_rgba(chrome.border, 0.60),
+        ));
+
+        // 3. Search Input Header
+        let input_h = 44.0 * scale;
+        let input_pad_x = 16.0 * scale;
+
+        // Mode badge indicator
+        let mode_label = match palette.mode {
+            PaletteMode::Commands => "AGENT & COMMAND PALETTE",
+            PaletteMode::History => "VISUAL HISTORY SEARCH",
+        };
+        self.modal_labels.push(Label {
+            text: mode_label.to_string(),
+            x: card_x + input_pad_x,
+            y: card_y + 7.0 * scale,
+            max_width: card_w - input_pad_x * 2.0,
+            color: chrome.text_tertiary,
+            font_size: 9.0,
+            line_height: 11.0,
+        });
+
+        // Prompt symbol
+        self.modal_labels.push(Label {
+            text: ">".to_string(),
+            x: card_x + input_pad_x,
+            y: card_y + 20.0 * scale,
+            max_width: 14.0 * scale,
+            color: chrome.text_primary,
+            font_size: 14.0,
+            line_height: 18.0,
+        });
+
+        // Search text / placeholder
+        let placeholder = match palette.mode {
+            PaletteMode::Commands => "Search agents, actions, prompts, or history…",
+            PaletteMode::History => "Search recent shell commands…",
+        };
+        let (display_text, text_color) = if palette.query.is_empty() {
+            (placeholder.to_string(), chrome.text_tertiary)
+        } else {
+            (palette.query.clone(), chrome.text_primary)
+        };
+
+        let text_x = card_x + input_pad_x + 16.0 * scale;
+        self.modal_labels.push(Label {
+            text: display_text,
+            x: text_x,
+            y: card_y + 20.0 * scale,
+            max_width: card_w - input_pad_x * 2.0 - 20.0 * scale,
+            color: text_color,
+            font_size: 13.0,
+            line_height: 18.0,
+        });
+
+        // Cursor beam
+        if !palette.query.is_empty() {
+            let char_w = 13.0 * scale * 0.58;
+            let chars_before = palette.query[..palette.cursor_pos].chars().count() as f32;
+            let cur_x = text_x + chars_before * char_w;
+            self.modal_over.push(Quad::new(
+                cur_x,
+                card_y + 22.0 * scale,
+                (1.5 * scale).max(1.0),
+                16.0 * scale,
+                linear_rgba(chrome.text_primary, 0.9),
+            ));
+        }
+
+        // Header bottom divider
+        self.modal_under.push(Quad::new(
+            card_x,
+            card_y + input_h,
+            card_w,
+            scale,
+            linear_rgba(chrome.border, 0.35),
+        ));
+
+        // 4. Results List
+        let list_top = card_y + input_h + 6.0 * scale;
+        let row_h = 38.0 * scale;
+        let row_margin = 8.0 * scale;
+        let row_w = card_w - row_margin * 2.0;
+        let footer_h = 28.0 * scale;
+        let available_list_h = card_h - input_h - footer_h - 12.0 * scale;
+        let max_visible = (available_list_h / row_h).floor() as usize;
+
+        let total = palette.filtered_items.len();
+        let start_idx = if palette.selected >= max_visible {
+            palette.selected + 1 - max_visible
+        } else {
+            0
+        };
+        let end_idx = (start_idx + max_visible).min(total);
+
+        if total == 0 {
+            self.modal_labels.push(Label {
+                text: "No matching commands or agents".to_string(),
+                x: card_x + 24.0 * scale,
+                y: list_top + 16.0 * scale,
+                max_width: card_w - 48.0 * scale,
+                color: chrome.text_tertiary,
+                font_size: 12.5,
+                line_height: 16.0,
+            });
+        }
+
+        for (slot, idx) in (start_idx..end_idx).enumerate() {
+            let item = &palette.filtered_items[idx];
+            let row_x = card_x + row_margin;
+            let row_y = list_top + slot as f32 * row_h;
+            let is_selected = idx == palette.selected;
+
+            // Selection rounded pill background
+            if is_selected {
+                self.modal_under.push(Quad::rounded(
+                    row_x,
+                    row_y,
+                    row_w,
+                    row_h,
+                    6.0 * scale,
+                    linear_rgba(chrome.surface_raised, 1.0),
+                ));
+            }
+
+            // Dot indicator: use item.icon_color or category accent
+            let dot_x = row_x + 10.0 * scale;
+            let dot_y = row_y + (row_h - 7.0 * scale) / 2.0;
+            if let Some(color) = item.icon_color {
+                self.modal_under.push(Quad::circle(
+                    dot_x,
+                    dot_y,
+                    7.0 * scale,
+                    linear_rgba(color, 1.0),
+                ));
+            } else {
+                let default_dot = match item.category {
+                    PaletteCategory::History => [0x6b, 0x6b, 0x6b],
+                    PaletteCategory::Action => [0x6c, 0x9e, 0xd9],
+                    PaletteCategory::Prompt => [0xe0, 0xb5, 0x5f],
+                    _ => chrome.text_tertiary,
+                };
+                self.modal_under.push(Quad::circle(
+                    dot_x,
+                    dot_y,
+                    5.0 * scale,
+                    linear_rgba(default_dot, 0.70),
+                ));
+            }
+
+            let title_x = row_x + 24.0 * scale;
+            let title_y = row_y + 4.0 * scale;
+            let title_color = if is_selected {
+                chrome.text_primary
+            } else {
+                chrome.text_secondary
+            };
+
+            // Badge width calculation
+            let badge_w = if item.badge.is_some() { 76.0 * scale } else { 0.0 };
+            let max_text_w = row_w - 32.0 * scale - badge_w;
+
+            self.modal_labels.push(Label {
+                text: item.title.clone(),
+                x: title_x,
+                y: title_y,
+                max_width: max_text_w,
+                color: title_color,
+                font_size: 12.0,
+                line_height: 15.0,
+            });
+
+            if let Some(ref sub) = item.subtitle {
+                self.modal_labels.push(Label {
+                    text: sub.clone(),
+                    x: title_x,
+                    y: title_y + 15.0 * scale,
+                    max_width: max_text_w,
+                    color: chrome.text_tertiary,
+                    font_size: 10.0,
+                    line_height: 13.0,
+                });
+            }
+
+            if let Some(ref badge) = item.badge {
+                self.modal_labels.push(Label {
+                    text: badge.clone(),
+                    x: row_x + row_w - badge_w,
+                    y: row_y + (row_h - 14.0 * scale) / 2.0,
+                    max_width: badge_w,
+                    color: if is_selected { chrome.text_secondary } else { chrome.text_tertiary },
+                    font_size: 9.5,
+                    line_height: 14.0,
+                });
+            }
+        }
+
+        // 5. Footer Hint Bar
+        let footer_y = card_y + card_h - footer_h;
+        self.modal_under.push(Quad::new(
+            card_x,
+            footer_y,
+            card_w,
+            scale,
+            linear_rgba(chrome.border, 0.30),
+        ));
+
+        let hint = "↵ run / select  •  Tab insert at prompt  •  ↑↓ navigate  •  esc dismiss";
+        self.modal_labels.push(Label {
+            text: hint.to_string(),
+            x: card_x + 16.0 * scale,
+            y: footer_y + (footer_h - 14.0 * scale) / 2.0,
+            max_width: card_w - 32.0 * scale,
+            color: chrome.text_tertiary,
+            font_size: 10.0,
+            line_height: 14.0,
+        });
     }
 
     /// Emits the sidebar.
@@ -902,6 +1374,34 @@ impl Renderer {
 
         let attrs = Attrs::new().family(Family::SansSerif);
         for (label, buffer) in self.labels.iter().zip(self.chrome_bufs.iter_mut()) {
+            let metrics = Metrics::new(
+                label.font_size * self.scale,
+                label.line_height * self.scale,
+            );
+            buffer.set_metrics(metrics);
+            buffer.set_size(Some(label.max_width), Some(metrics.line_height * 1.5));
+            buffer.set_text(&label.text, &attrs, Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut self.font_system, false);
+        }
+    }
+
+    /// Shapes modal overlay labels (command palette, find bar).
+    fn sync_modal_buffers(&mut self) {
+        let fallback = Metrics::new(
+            CHROME_FONT_SIZE * self.scale,
+            CHROME_LINE_HEIGHT * self.scale,
+        );
+
+        while self.modal_bufs.len() < self.modal_labels.len() {
+            let mut buffer = TextBuffer::new(&mut self.font_system, fallback);
+            buffer.set_wrap(Wrap::None);
+            buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
+            self.modal_bufs.push(buffer);
+        }
+        self.modal_bufs.truncate(self.modal_labels.len());
+
+        let attrs = Attrs::new().family(Family::SansSerif);
+        for (label, buffer) in self.modal_labels.iter().zip(self.modal_bufs.iter_mut()) {
             let metrics = Metrics::new(
                 label.font_size * self.scale,
                 label.line_height * self.scale,

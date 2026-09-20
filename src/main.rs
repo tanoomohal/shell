@@ -3,8 +3,10 @@
 
 mod agent;
 mod clipboard;
+mod find;
 mod input;
 mod links;
+mod palette;
 mod quad;
 mod renderer;
 mod session;
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, WindowSize};
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
@@ -26,10 +28,11 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Theme as WindowTheme, Window, WindowId};
 
 use clipboard::Clipboard;
+use palette::{PaletteAction, PaletteMode, PaletteState};
 use renderer::Renderer;
 use session::{Session, TermSize, UserEvent};
 use ui::Hit;
@@ -90,6 +93,8 @@ struct State {
     hovered_link: Option<(Line, std::ops::Range<usize>, String)>,
     click_count: u32,
     clipboard: Clipboard,
+    find: Option<find::FindState>,
+    palette: Option<PaletteState>,
     /// Clock for the attention pulse.
     started: Instant,
     renderer: Renderer,
@@ -284,7 +289,31 @@ impl State {
         }
         self.active = index;
         self.sessions[index].needs_attention = false;
+        if let Some(ref mut find) = self.find {
+            let term = self.sessions[index].term.lock();
+            find.search(&term);
+        }
         self.renderer.window().request_redraw();
+    }
+
+    fn scroll_to_find_match(&mut self) {
+        let Some(ref find) = self.find else {
+            return;
+        };
+        let Some(m) = find.current_match() else {
+            return;
+        };
+        let line = m.line;
+        let mut term = self.sessions[self.active].term.lock();
+        let display_offset = term.grid().display_offset() as i32;
+        let screen_lines = term.grid().screen_lines() as i32;
+        let viewport_line = line.0 + display_offset;
+        if viewport_line < 0 || viewport_line >= screen_lines {
+            let target = screen_lines / 3;
+            let new_offset = target - line.0;
+            let delta = new_offset - display_offset;
+            term.scroll_display(Scroll::Delta(delta));
+        }
     }
 
     fn cycle(&mut self, forward: bool) {
@@ -376,6 +405,8 @@ impl ApplicationHandler<UserEvent> for App {
             hovered_link: None,
             click_count: 0,
             clipboard: Clipboard::new(),
+            find: None,
+            palette: None,
             started: Instant::now(),
             renderer,
         });
@@ -474,6 +505,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if state.selecting {
                     state.selecting = false;
                     state.copy_selection_to_primary();
+                    state.copy_selection();
                 }
             },
 
@@ -482,6 +514,19 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Middle,
                 ..
             } => state.paste_primary(),
+
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                let has_selection = state.active_session().term.lock().selection.is_some();
+                if has_selection {
+                    state.copy_selection();
+                } else {
+                    state.paste();
+                }
+            },
 
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -546,82 +591,440 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Application shortcuts are handled before the pty sees the key.
-                if is_app_modifier(state.mods) {
-                    match &event.logical_key {
-                        Key::Character(c) => match c.as_str() {
-                            "t" => {
-                                match spawn_session(
-                                    &mut self.next_id,
-                                    &self.proxy,
-                                    &state.renderer,
-                                ) {
-                                    Ok(session) => state.push_session(session),
-                                    Err(err) => log::error!("failed to spawn pty: {err}"),
-                                }
-                                return;
-                            },
-                            "w" => {
-                                let active = state.active;
-                                if !state.close(active) {
-                                    event_loop.exit();
-                                }
-                                return;
-                            },
-                            "c" => {
-                                state.copy_selection();
-                                return;
-                            },
-                            "v" => {
-                                state.paste();
-                                return;
-                            },
-                            "a" => {
-                                state.select_all();
-                                return;
-                            },
-                            "k" => {
-                                state.clear_scrollback();
-                                return;
-                            },
-                            "+" | "=" => {
-                                state.adjust_font_size(FONT_STEP);
-                                return;
-                            },
-                            "-" => {
-                                state.adjust_font_size(-FONT_STEP);
-                                return;
-                            },
-                            "0" => {
-                                state.adjust_font_size(0.0);
-                                return;
-                            },
-                            "]" => {
-                                state.cycle(true);
-                                return;
-                            },
-                            "[" => {
-                                state.cycle(false);
-                                return;
-                            },
-                            digit
-                                if digit.len() == 1
-                                    && digit.chars().all(|c| c.is_ascii_digit()) =>
-                            {
-                                if let Ok(n) = digit.parse::<usize>() {
-                                    if n >= 1 {
-                                        state.activate(n - 1);
+                let is_cmd = state.mods.super_key();
+                let is_ctrl_shift = state.mods.control_key() && state.mods.shift_key();
+                let is_app_shortcut = is_cmd || is_ctrl_shift;
+
+                if is_app_shortcut {
+                    let matches_key = |target_code: KeyCode, target_ch: char| -> bool {
+                        if matches!(event.physical_key, PhysicalKey::Code(code) if code == target_code) {
+                            return true;
+                        }
+                        if let Key::Character(ref s) = event.logical_key {
+                            if s.eq_ignore_ascii_case(&target_ch.to_string()) {
+                                return true;
+                            }
+                        }
+                        false
+                    };
+
+                    if matches_key(KeyCode::KeyC, 'c') {
+                        let selected = state.active_session().term.lock().selection_to_string();
+                        if let Some(text) = selected.filter(|t| !t.is_empty()) {
+                            state.clipboard.set(&text);
+                        } else {
+                            // No selection: send SIGINT (\x03) so Cmd+C cancels running process / prompt
+                            state.sessions[state.active].write(vec![0x03]);
+                        }
+                        state.renderer.window().request_redraw();
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyX, 'x') {
+                        let selected = state.active_session().term.lock().selection_to_string();
+                        if let Some(text) = selected.filter(|t| !t.is_empty()) {
+                            state.clipboard.set(&text);
+                            state.sessions[state.active].term.lock().selection = None;
+                        } else {
+                            // Cut current line at prompt: copy row text and send Ctrl+U (\x15)
+                            let line_text = {
+                                let session = state.active_session();
+                                let term = session.term.lock();
+                                let cursor = term.grid().cursor.point;
+                                session.row_text(cursor.line)
+                            };
+                            let trimmed = line_text.trim_end();
+                            if !trimmed.is_empty() {
+                                state.clipboard.set(trimmed);
+                            }
+                            state.sessions[state.active].write(vec![0x15]);
+                        }
+                        state.renderer.window().request_redraw();
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyV, 'v') {
+                        if let Some(ref mut find) = state.find {
+                            if let Some(text) = state.clipboard.get() {
+                                let first_line = text.lines().next().unwrap_or("");
+                                find.insert_str(first_line);
+                                let term = state.sessions[state.active].term.lock();
+                                find.search(&term);
+                            }
+                            state.renderer.window().request_redraw();
+                        } else if let Some(ref mut palette) = state.palette {
+                            if let Some(text) = state.clipboard.get() {
+                                let first_line = text.lines().next().unwrap_or("");
+                                for ch in first_line.chars() {
+                                    if !ch.is_control() {
+                                        palette.insert_char(ch);
                                     }
                                 }
-                                return;
+                                palette.update_items(&state.sessions, state.active);
+                            }
+                            state.renderer.window().request_redraw();
+                        } else {
+                            state.paste();
+                        }
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyA, 'a') {
+                        state.select_all();
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyT, 't') {
+                        match spawn_session(
+                            &mut self.next_id,
+                            &self.proxy,
+                            &state.renderer,
+                        ) {
+                            Ok(session) => state.push_session(session),
+                            Err(err) => log::error!("failed to spawn pty: {err}"),
+                        }
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyW, 'w') {
+                        let active = state.active;
+                        if !state.close(active) {
+                            event_loop.exit();
+                        }
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyK, 'k') {
+                        state.clear_scrollback();
+                        return;
+                    }
+
+                    if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd))
+                        || matches!(&event.logical_key, Key::Character(c) if c.as_str() == "+" || c.as_str() == "=")
+                    {
+                        state.adjust_font_size(FONT_STEP);
+                        return;
+                    }
+
+                    if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract))
+                        || matches!(&event.logical_key, Key::Character(c) if c.as_str() == "-")
+                    {
+                        state.adjust_font_size(-FONT_STEP);
+                        return;
+                    }
+
+                    if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Digit0 | KeyCode::Numpad0))
+                        || matches!(&event.logical_key, Key::Character(c) if c.as_str() == "0")
+                    {
+                        state.adjust_font_size(0.0);
+                        return;
+                    }
+
+                    if matches_key(KeyCode::BracketRight, ']') {
+                        state.cycle(true);
+                        return;
+                    }
+
+                    if matches_key(KeyCode::BracketLeft, '[') {
+                        state.cycle(false);
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyF, 'f') {
+                        let initial = {
+                            let term = state.sessions[state.active].term.lock();
+                            term.selection_to_string().unwrap_or_default()
+                        };
+                        if initial.is_empty() {
+                            state.find.get_or_insert_with(find::FindState::new);
+                        } else {
+                            state.find = Some(find::FindState::with_query(&initial));
+                        }
+                        if let Some(ref mut find) = state.find {
+                            let term = state.sessions[state.active].term.lock();
+                            find.search(&term);
+                        }
+                        state.renderer.window().request_redraw();
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyG, 'g') {
+                        if let Some(ref mut find) = state.find {
+                            if state.mods.shift_key() {
+                                find.prev_match();
+                            } else {
+                                find.next_match();
+                            }
+                            state.scroll_to_find_match();
+                            state.renderer.window().request_redraw();
+                        }
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyQ, 'q') {
+                        for session in &state.sessions {
+                            session.shutdown();
+                        }
+                        event_loop.exit();
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyP, 'p') {
+                        if state
+                            .palette
+                            .as_ref()
+                            .map(|p| p.mode == PaletteMode::Commands)
+                            .unwrap_or(false)
+                        {
+                            state.palette = None;
+                        } else {
+                            let mut p = PaletteState::new(PaletteMode::Commands);
+                            p.update_items(&state.sessions, state.active);
+                            state.palette = Some(p);
+                        }
+                        state.renderer.window().request_redraw();
+                        return;
+                    }
+
+                    if matches_key(KeyCode::KeyR, 'r') {
+                        if state
+                            .palette
+                            .as_ref()
+                            .map(|p| p.mode == PaletteMode::History)
+                            .unwrap_or(false)
+                        {
+                            state.palette = None;
+                        } else {
+                            let mut p = PaletteState::new(PaletteMode::History);
+                            p.update_items(&state.sessions, state.active);
+                            state.palette = Some(p);
+                        }
+                        state.renderer.window().request_redraw();
+                        return;
+                    }
+
+                    if matches!(&event.logical_key, Key::Named(NamedKey::Tab)) {
+                        state.cycle(!state.mods.shift_key());
+                        return;
+                    }
+
+                    let digit_opt = match &event.physical_key {
+                        PhysicalKey::Code(KeyCode::Digit1) => Some(1),
+                        PhysicalKey::Code(KeyCode::Digit2) => Some(2),
+                        PhysicalKey::Code(KeyCode::Digit3) => Some(3),
+                        PhysicalKey::Code(KeyCode::Digit4) => Some(4),
+                        PhysicalKey::Code(KeyCode::Digit5) => Some(5),
+                        PhysicalKey::Code(KeyCode::Digit6) => Some(6),
+                        PhysicalKey::Code(KeyCode::Digit7) => Some(7),
+                        PhysicalKey::Code(KeyCode::Digit8) => Some(8),
+                        PhysicalKey::Code(KeyCode::Digit9) => Some(9),
+                        _ => {
+                            if let Key::Character(ref c) = event.logical_key {
+                                c.parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        },
+                    };
+                    if let Some(n) = digit_opt {
+                        if n >= 1 {
+                            state.activate(n - 1);
+                        }
+                        return;
+                    }
+                }
+
+                // Palette mode (Arc/Dia-style visual fuzzy command & history overlay):
+                // keys go to the palette, not the pty.
+                if state.palette.is_some() {
+                    let mut close_palette = false;
+                    let mut action_to_execute = None;
+                    let mut insert_to_pty = None;
+
+                    {
+                        let palette = state.palette.as_mut().unwrap();
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                close_palette = true;
+                            },
+                            Key::Named(NamedKey::ArrowUp) => {
+                                palette.select_prev();
+                            },
+                            Key::Named(NamedKey::ArrowDown) => {
+                                palette.select_next();
+                            },
+                            Key::Named(NamedKey::Enter) => {
+                                if let Some(item) = palette.current_item() {
+                                    action_to_execute = Some(item.action.clone());
+                                }
+                                close_palette = true;
+                            },
+                            Key::Named(NamedKey::Tab) => {
+                                if let Some(item) = palette.current_item() {
+                                    if let PaletteAction::WriteToPty { ref text, .. } = item.action {
+                                        insert_to_pty = Some(text.clone());
+                                    }
+                                }
+                                close_palette = true;
+                            },
+                            Key::Named(NamedKey::Backspace) => {
+                                if state.mods.alt_key() {
+                                    palette.delete_word();
+                                } else {
+                                    palette.backspace();
+                                }
+                                palette.update_items(&state.sessions, state.active);
+                            },
+                            Key::Named(NamedKey::ArrowLeft) => palette.cursor_left(),
+                            Key::Named(NamedKey::ArrowRight) => palette.cursor_right(),
+                            Key::Named(NamedKey::Home) => palette.cursor_home(),
+                            Key::Named(NamedKey::End) => palette.cursor_end(),
+                            Key::Character(c) => {
+                                if state.mods.control_key() {
+                                    match c.as_str() {
+                                        "p" => palette.select_prev(),
+                                        "n" => palette.select_next(),
+                                        "u" => {
+                                            palette.query.clear();
+                                            palette.cursor_pos = 0;
+                                            palette.update_items(&state.sessions, state.active);
+                                        },
+                                        "w" => {
+                                            palette.delete_word();
+                                            palette.update_items(&state.sessions, state.active);
+                                        },
+                                        _ => {},
+                                    }
+                                } else if !state.mods.super_key() {
+                                    let input = event.text.as_deref().unwrap_or(c.as_str());
+                                    for ch in input.chars() {
+                                        if !ch.is_control() {
+                                            palette.insert_char(ch);
+                                        }
+                                    }
+                                    palette.update_items(&state.sessions, state.active);
+                                }
                             },
                             _ => {},
-                        },
-                        Key::Named(NamedKey::Tab) => {
-                            state.cycle(!state.mods.shift_key());
-                            return;
-                        },
-                        _ => {},
+                        }
                     }
+
+                    if close_palette {
+                        state.palette = None;
+                    }
+
+                    if let Some(text) = insert_to_pty {
+                        let session = &state.sessions[state.active];
+                        session.write(text.into_bytes());
+                    }
+
+                    if let Some(action) = action_to_execute {
+                        match action {
+                            PaletteAction::WriteToPty { text, execute } => {
+                                let session = &state.sessions[state.active];
+                                let mut bytes = text.into_bytes();
+                                if execute {
+                                    bytes.push(b'\r');
+                                }
+                                session.write(bytes);
+                            },
+                            PaletteAction::SwitchTab(index) => {
+                                state.activate(index);
+                            },
+                            PaletteAction::SpawnAgent { name: _, command } => {
+                                match spawn_session(&mut self.next_id, &self.proxy, &state.renderer) {
+                                    Ok(session) => {
+                                        if let Some(cmd) = command {
+                                            session.write(format!("{cmd}\r").into_bytes());
+                                        }
+                                        state.push_session(session);
+                                    },
+                                    Err(err) => log::error!("failed to spawn pty: {err}"),
+                                }
+                            },
+                            PaletteAction::ClearScrollback => {
+                                state.clear_scrollback();
+                            },
+                            PaletteAction::FindInBuffer => {
+                                state.find.get_or_insert_with(find::FindState::new);
+                            },
+                            PaletteAction::Zoom(delta) => {
+                                state.adjust_font_size(delta * FONT_STEP);
+                            },
+                        }
+                    }
+
+                    state.renderer.window().request_redraw();
+                    return;
+                }
+
+                // Find mode: keys go to the search bar, not the pty.
+                if state.find.is_some() {
+                    let mut close_find = false;
+                    {
+                        let find = state.find.as_mut().unwrap();
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                close_find = true;
+                            },
+                            Key::Named(NamedKey::Enter) => {
+                                if state.mods.shift_key() {
+                                    find.prev_match();
+                                } else {
+                                    find.next_match();
+                                }
+                            },
+                            Key::Named(NamedKey::Backspace) => {
+                                if state.mods.alt_key() {
+                                    find.delete_word();
+                                } else {
+                                    find.backspace();
+                                }
+                                let term = state.sessions[state.active].term.lock();
+                                find.search(&term);
+                            },
+                            Key::Named(NamedKey::Delete) => {
+                                find.delete_forward();
+                                let term = state.sessions[state.active].term.lock();
+                                find.search(&term);
+                            },
+                            Key::Named(NamedKey::ArrowLeft) => find.cursor_left(),
+                            Key::Named(NamedKey::ArrowRight) => find.cursor_right(),
+                            Key::Named(NamedKey::Home) => find.cursor_home(),
+                            Key::Named(NamedKey::End) => find.cursor_end(),
+                            Key::Character(c) => {
+                                if state.mods.control_key() {
+                                    match c.as_str() {
+                                        "a" => find.cursor_home(),
+                                        "e" => find.cursor_end(),
+                                        "k" => find.kill_to_end(),
+                                        "u" => find.kill_to_start(),
+                                        "w" => find.delete_word(),
+                                        _ => {},
+                                    }
+                                    let term = state.sessions[state.active].term.lock();
+                                    find.search(&term);
+                                } else {
+                                    let input = event.text.as_deref().unwrap_or(c.as_str());
+                                    for ch in input.chars() {
+                                        if !ch.is_control() {
+                                            find.insert(ch);
+                                        }
+                                    }
+                                    let term = state.sessions[state.active].term.lock();
+                                    find.search(&term);
+                                }
+                            },
+                            _ => {},
+                        }
+                    }
+                    if close_find {
+                        state.find = None;
+                    } else {
+                        state.scroll_to_find_match();
+                    }
+                    state.renderer.window().request_redraw();
+                    return;
                 }
 
                 let app_cursor = state
@@ -675,7 +1078,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 let active = state.active;
                 let breathe = state.breathe();
-                state.renderer.render(&state.sessions, active, breathe);
+                state.renderer.render(
+                    &state.sessions,
+                    active,
+                    breathe,
+                    state.find.as_ref(),
+                    state.palette.as_ref(),
+                );
             },
 
             _ => {},

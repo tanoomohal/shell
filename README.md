@@ -106,11 +106,13 @@ Regenerate icons from source artwork with
 
 | | |
 |---|---|
+| `P` | Agent & Command palette (Arc/Dia-style overlay) |
+| `R` | Visual fuzzy history search |
 | `T` / `W` | New tab / close tab |
 | `1`–`9` | Jump to tab |
 | `[` `]` / `Tab` | Cycle tabs |
 | `C` / `V` | Copy / paste |
-| `F` | Find in buffer *(not yet)* |
+| `F` | Find in buffer |
 | `A` | Select all |
 | `K` | Clear screen and scrollback |
 | `+` `-` `0` | Font size up, down, reset |
@@ -128,14 +130,15 @@ modifier parameters and application cursor mode, resize, HiDPI, copy and
 paste with bracketed-paste hardening, OSC 52, primary selection and
 middle-click paste on Linux, mouse selection by character, word and line,
 clickable URLs, font zoom, resizable sidebar, per-tab output summaries, agent
-detection with attention state and sub-agent counts, and a theme system that
-follows system appearance.
+detection with attention state and sub-agent counts, theme system that
+follows system appearance, find-in-buffer search overlay, and an Arc/Dia-style
+floating command and history palette centered around agent CLIs.
 
 Shell-side line editing — history, `Ctrl+R`, `Ctrl+A`/`E`/`W`/`U`/`K`, Tab
-completion — is the shell's own and passes through untouched. There are tests
+completion, and `Ctrl+_`/`Ctrl+/` undo — is the shell's own and passes through untouched. There are tests
 asserting exactly that, so a future shortcut can't quietly swallow one.
 
-Not yet: find-in-buffer, a settings UI, multiple windows, command palette,
+Not yet: a settings UI, multiple windows,
 split panes, session persistence, and mouse reporting to programs that request
 it. CJK wide characters get one cell of advance instead of two, and the grid
 re-shapes each frame rather than caching glyphs per cell — fine at current

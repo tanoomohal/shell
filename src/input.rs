@@ -23,10 +23,15 @@ fn csi(mods: ModifiersState, base: &str, suffix: char) -> Vec<u8> {
 /// Arrow and Home/End keys switch between CSI and SS3 form depending on
 /// whether the application has requested cursor-key application mode.
 fn cursor_key(mods: ModifiersState, app_cursor: bool, suffix: char) -> Vec<u8> {
-    if app_cursor && modifier_param(mods) == 1 {
-        format!("\x1bO{suffix}").into_bytes()
+    let m = modifier_param(mods);
+    if m == 1 {
+        if app_cursor {
+            format!("\x1bO{suffix}").into_bytes()
+        } else {
+            format!("\x1b[{suffix}").into_bytes()
+        }
     } else {
-        csi(mods, "1", suffix)
+        format!("\x1b[1;{m}{suffix}").into_bytes()
     }
 }
 
@@ -51,7 +56,7 @@ fn character(c: char, mods: ModifiersState) -> Option<Vec<u8>> {
             '\\' => Some(0x1c),
             ']' => Some(0x1d),
             '^' => Some(0x1e),
-            '_' => Some(0x1f),
+            '_' | '/' | '-' => Some(0x1f),
             '?' => Some(0x7f),
             _ => None,
         };
@@ -91,14 +96,18 @@ pub fn encode(
     match key {
         Key::Named(named) => Some(match named {
             NamedKey::Enter => {
-                if mods.alt_key() {
+                if mods.alt_key() || mods.shift_key() {
                     b"\x1b\r".to_vec()
                 } else {
                     b"\r".to_vec()
                 }
             },
             NamedKey::Backspace => {
-                if mods.alt_key() {
+                if mods.super_key() {
+                    b"\x15".to_vec() // Cmd+Backspace line rubout (Ctrl+U)
+                } else if mods.control_key() {
+                    b"\x17".to_vec() // Ctrl+Backspace word rubout (Ctrl+W)
+                } else if mods.alt_key() {
                     b"\x1b\x7f".to_vec()
                 } else {
                     b"\x7f".to_vec()
@@ -114,8 +123,20 @@ pub fn encode(
             NamedKey::Escape => b"\x1b".to_vec(),
             NamedKey::ArrowUp => cursor_key(mods, app_cursor, 'A'),
             NamedKey::ArrowDown => cursor_key(mods, app_cursor, 'B'),
-            NamedKey::ArrowRight => cursor_key(mods, app_cursor, 'C'),
-            NamedKey::ArrowLeft => cursor_key(mods, app_cursor, 'D'),
+            NamedKey::ArrowRight => {
+                if mods.super_key() {
+                    b"\x05".to_vec() // Cmd+Right: end of line (Ctrl+E)
+                } else {
+                    cursor_key(mods, app_cursor, 'C')
+                }
+            },
+            NamedKey::ArrowLeft => {
+                if mods.super_key() {
+                    b"\x01".to_vec() // Cmd+Left: start of line (Ctrl+A)
+                } else {
+                    cursor_key(mods, app_cursor, 'D')
+                }
+            },
             NamedKey::Home => cursor_key(mods, app_cursor, 'H'),
             NamedKey::End => cursor_key(mods, app_cursor, 'F'),
             NamedKey::Insert => tilde(mods, 2),
@@ -206,7 +227,7 @@ mod tests {
         // Normal mode: CSI. Application cursor mode: SS3.
         assert_eq!(
             encode(&Key::Named(NamedKey::ArrowUp), None, none, false),
-            Some(b"\x1b[1A".to_vec())
+            Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
             encode(&Key::Named(NamedKey::ArrowUp), None, none, true),
@@ -214,7 +235,7 @@ mod tests {
         );
         assert_eq!(
             encode(&Key::Named(NamedKey::ArrowDown), None, none, false),
-            Some(b"\x1b[1B".to_vec())
+            Some(b"\x1b[B".to_vec())
         );
     }
 
@@ -239,6 +260,54 @@ mod tests {
         assert_eq!(
             encode(&key("b"), Some("b"), ModifiersState::ALT, false),
             Some(vec![0x1b, b'b'])
+        );
+    }
+
+    #[test]
+    fn ctrl_slash_and_underscore_encode_undo() {
+        assert_eq!(
+            encode(&key("/"), None, ctrl(), false),
+            Some(vec![0x1f])
+        );
+        assert_eq!(
+            encode(&key("_"), None, ctrl(), false),
+            Some(vec![0x1f])
+        );
+    }
+
+    #[test]
+    fn enter_with_alt_or_shift_encodes_newline() {
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Enter), None, ModifiersState::SHIFT, false),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Enter), None, ModifiersState::ALT, false),
+            Some(b"\x1b\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_backspace_encodes_word_rubout() {
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Backspace), None, ctrl(), false),
+            Some(b"\x17".to_vec())
+        );
+    }
+
+    #[test]
+    fn cmd_left_right_and_backspace_encode_line_navigation() {
+        assert_eq!(
+            encode(&Key::Named(NamedKey::ArrowLeft), None, ModifiersState::SUPER, false),
+            Some(vec![0x01])
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::ArrowRight), None, ModifiersState::SUPER, false),
+            Some(vec![0x05])
+        );
+        assert_eq!(
+            encode(&Key::Named(NamedKey::Backspace), None, ModifiersState::SUPER, false),
+            Some(vec![0x15])
         );
     }
 }
